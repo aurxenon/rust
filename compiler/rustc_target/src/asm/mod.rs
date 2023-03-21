@@ -164,6 +164,7 @@ macro_rules! types {
 }
 
 mod aarch64;
+mod alpha;
 mod arm;
 mod avr;
 mod bpf;
@@ -181,6 +182,7 @@ mod wasm;
 mod x86;
 
 pub use aarch64::{AArch64InlineAsmReg, AArch64InlineAsmRegClass};
+pub use alpha::{AlphaInlineAsmReg, AlphaInlineAsmRegClass};
 pub use arm::{ArmInlineAsmReg, ArmInlineAsmRegClass};
 pub use avr::{AvrInlineAsmReg, AvrInlineAsmRegClass};
 pub use bpf::{BpfInlineAsmReg, BpfInlineAsmRegClass};
@@ -203,6 +205,7 @@ pub enum InlineAsmArch {
     X86_64,
     Arm,
     AArch64,
+    Alpha,
     RiscV32,
     RiscV64,
     Nvptx64,
@@ -231,6 +234,7 @@ impl FromStr for InlineAsmArch {
             "x86_64" => Ok(Self::X86_64),
             "arm" => Ok(Self::Arm),
             "aarch64" => Ok(Self::AArch64),
+            "alpha" => Ok(Self::Alpha),
             "riscv32" => Ok(Self::RiscV32),
             "riscv64" => Ok(Self::RiscV64),
             "nvptx64" => Ok(Self::Nvptx64),
@@ -259,6 +263,7 @@ pub enum InlineAsmReg {
     X86(X86InlineAsmReg),
     Arm(ArmInlineAsmReg),
     AArch64(AArch64InlineAsmReg),
+    Alpha(AlphaInlineAsmReg),
     RiscV(RiscVInlineAsmReg),
     Nvptx(NvptxInlineAsmReg),
     PowerPC(PowerPCInlineAsmReg),
@@ -282,6 +287,7 @@ impl InlineAsmReg {
             Self::X86(r) => r.name(),
             Self::Arm(r) => r.name(),
             Self::AArch64(r) => r.name(),
+            Self::Alpha(r) => r.name(),
             Self::RiscV(r) => r.name(),
             Self::PowerPC(r) => r.name(),
             Self::Hexagon(r) => r.name(),
@@ -301,6 +307,7 @@ impl InlineAsmReg {
             Self::X86(r) => InlineAsmRegClass::X86(r.reg_class()),
             Self::Arm(r) => InlineAsmRegClass::Arm(r.reg_class()),
             Self::AArch64(r) => InlineAsmRegClass::AArch64(r.reg_class()),
+            Self::Alpha(r) => InlineAsmRegClass::Alpha(r.reg_class()),
             Self::RiscV(r) => InlineAsmRegClass::RiscV(r.reg_class()),
             Self::PowerPC(r) => InlineAsmRegClass::PowerPC(r.reg_class()),
             Self::Hexagon(r) => InlineAsmRegClass::Hexagon(r.reg_class()),
@@ -323,6 +330,7 @@ impl InlineAsmReg {
             InlineAsmArch::X86 | InlineAsmArch::X86_64 => Self::X86(X86InlineAsmReg::parse(name)?),
             InlineAsmArch::Arm => Self::Arm(ArmInlineAsmReg::parse(name)?),
             InlineAsmArch::AArch64 => Self::AArch64(AArch64InlineAsmReg::parse(name)?),
+            InlineAsmArch::Alpha => Self::Alpha(AlphaInlineAsmReg::parse(name)?),
             InlineAsmArch::RiscV32 | InlineAsmArch::RiscV64 => {
                 Self::RiscV(RiscVInlineAsmReg::parse(name)?)
             }
@@ -359,6 +367,7 @@ impl InlineAsmReg {
             Self::X86(r) => r.validate(arch, reloc_model, target_features, target, is_clobber),
             Self::Arm(r) => r.validate(arch, reloc_model, target_features, target, is_clobber),
             Self::AArch64(r) => r.validate(arch, reloc_model, target_features, target, is_clobber),
+            Self::Alpha(r) => r.validate(arch, reloc_model, target_features, target, is_clobber),
             Self::RiscV(r) => r.validate(arch, reloc_model, target_features, target, is_clobber),
             Self::PowerPC(r) => r.validate(arch, reloc_model, target_features, target, is_clobber),
             Self::Hexagon(r) => r.validate(arch, reloc_model, target_features, target, is_clobber),
@@ -387,6 +396,7 @@ impl InlineAsmReg {
             Self::X86(r) => r.emit(out, arch, modifier),
             Self::Arm(r) => r.emit(out, arch, modifier),
             Self::AArch64(r) => r.emit(out, arch, modifier),
+            Self::Alpha(r) => r.emit(out, arch, modifier),
             Self::RiscV(r) => r.emit(out, arch, modifier),
             Self::PowerPC(r) => r.emit(out, arch, modifier),
             Self::Hexagon(r) => r.emit(out, arch, modifier),
@@ -406,6 +416,7 @@ impl InlineAsmReg {
             Self::X86(r) => r.overlapping_regs(|r| cb(Self::X86(r))),
             Self::Arm(r) => r.overlapping_regs(|r| cb(Self::Arm(r))),
             Self::AArch64(_) => cb(self),
+            Self::Alpha(_) => cb(self),
             Self::RiscV(_) => cb(self),
             Self::PowerPC(r) => r.overlapping_regs(|r| cb(Self::PowerPC(r))),
             Self::Hexagon(r) => r.overlapping_regs(|r| cb(Self::Hexagon(r))),
@@ -427,6 +438,7 @@ pub enum InlineAsmRegClass {
     X86(X86InlineAsmRegClass),
     Arm(ArmInlineAsmRegClass),
     AArch64(AArch64InlineAsmRegClass),
+    Alpha(AlphaInlineAsmRegClass),
     RiscV(RiscVInlineAsmRegClass),
     Nvptx(NvptxInlineAsmRegClass),
     PowerPC(PowerPCInlineAsmRegClass),
@@ -450,6 +462,7 @@ impl InlineAsmRegClass {
             Self::X86(r) => r.name(),
             Self::Arm(r) => r.name(),
             Self::AArch64(r) => r.name(),
+            Self::Alpha(r) => r.name(),
             Self::RiscV(r) => r.name(),
             Self::Nvptx(r) => r.name(),
             Self::PowerPC(r) => r.name(),
@@ -475,6 +488,7 @@ impl InlineAsmRegClass {
             Self::X86(r) => r.suggest_class(arch, ty).map(InlineAsmRegClass::X86),
             Self::Arm(r) => r.suggest_class(arch, ty).map(InlineAsmRegClass::Arm),
             Self::AArch64(r) => r.suggest_class(arch, ty).map(InlineAsmRegClass::AArch64),
+            Self::Alpha(r) => r.suggest_class(arch, ty).map(InlineAsmRegClass::Alpha),
             Self::RiscV(r) => r.suggest_class(arch, ty).map(InlineAsmRegClass::RiscV),
             Self::Nvptx(r) => r.suggest_class(arch, ty).map(InlineAsmRegClass::Nvptx),
             Self::PowerPC(r) => r.suggest_class(arch, ty).map(InlineAsmRegClass::PowerPC),
@@ -507,6 +521,7 @@ impl InlineAsmRegClass {
             Self::X86(r) => r.suggest_modifier(arch, ty),
             Self::Arm(r) => r.suggest_modifier(arch, ty),
             Self::AArch64(r) => r.suggest_modifier(arch, ty),
+            Self::Alpha(r) => r.suggest_modifier(arch, ty),
             Self::RiscV(r) => r.suggest_modifier(arch, ty),
             Self::Nvptx(r) => r.suggest_modifier(arch, ty),
             Self::PowerPC(r) => r.suggest_modifier(arch, ty),
@@ -535,6 +550,7 @@ impl InlineAsmRegClass {
             Self::X86(r) => r.default_modifier(arch),
             Self::Arm(r) => r.default_modifier(arch),
             Self::AArch64(r) => r.default_modifier(arch),
+            Self::Alpha(r) => r.default_modifier(arch),
             Self::RiscV(r) => r.default_modifier(arch),
             Self::Nvptx(r) => r.default_modifier(arch),
             Self::PowerPC(r) => r.default_modifier(arch),
@@ -562,6 +578,7 @@ impl InlineAsmRegClass {
             Self::X86(r) => r.supported_types(arch),
             Self::Arm(r) => r.supported_types(arch),
             Self::AArch64(r) => r.supported_types(arch),
+            Self::Alpha(r) => r.supported_types(arch),
             Self::RiscV(r) => r.supported_types(arch),
             Self::Nvptx(r) => r.supported_types(arch),
             Self::PowerPC(r) => r.supported_types(arch),
@@ -586,6 +603,7 @@ impl InlineAsmRegClass {
             }
             InlineAsmArch::Arm => Self::Arm(ArmInlineAsmRegClass::parse(name)?),
             InlineAsmArch::AArch64 => Self::AArch64(AArch64InlineAsmRegClass::parse(name)?),
+            InlineAsmArch::Alpha => Self::Alpha(AlphaInlineAsmRegClass::parse(name)?),
             InlineAsmArch::RiscV32 | InlineAsmArch::RiscV64 => {
                 Self::RiscV(RiscVInlineAsmRegClass::parse(name)?)
             }
@@ -617,6 +635,7 @@ impl InlineAsmRegClass {
             Self::X86(r) => r.valid_modifiers(arch),
             Self::Arm(r) => r.valid_modifiers(arch),
             Self::AArch64(r) => r.valid_modifiers(arch),
+            Self::Alpha(r) => r.valid_modifiers(arch),
             Self::RiscV(r) => r.valid_modifiers(arch),
             Self::Nvptx(r) => r.valid_modifiers(arch),
             Self::PowerPC(r) => r.valid_modifiers(arch),
@@ -759,6 +778,11 @@ pub fn allocatable_registers(
         InlineAsmArch::AArch64 => {
             let mut map = aarch64::regclass_map();
             aarch64::fill_reg_map(arch, reloc_model, target_features, target, &mut map);
+            map
+        }
+        InlineAsmArch::Alpha => {
+            let mut map = alpha::regclass_map();
+            alpha::fill_reg_map(arch, reloc_model, target_features, target, &mut map);
             map
         }
         InlineAsmArch::RiscV32 | InlineAsmArch::RiscV64 => {
