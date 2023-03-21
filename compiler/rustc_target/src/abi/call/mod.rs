@@ -6,6 +6,7 @@ use std::fmt;
 use std::str::FromStr;
 
 mod aarch64;
+mod alpha;
 mod amdgpu;
 mod arm;
 mod avr;
@@ -690,6 +691,7 @@ impl<'a, Ty> FnAbi<'a, Ty> {
                 };
                 aarch64::compute_abi_info(cx, self, param_policy)
             }
+            "alpha" => alpha::compute_abi_info(self),
             "amdgpu" => amdgpu::compute_abi_info(cx, self),
             "arm" => arm::compute_abi_info(cx, self),
             "avr" => avr::compute_abi_info(self),
