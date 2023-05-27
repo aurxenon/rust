@@ -10,7 +10,7 @@ pub fn target() -> Target {
 
         options: TargetOptions {
             linker_flavor: LinkerFlavor::Gnu(Cc::Yes, Lld::No),
-            linker: Some("alpha-unknown-elf-gcc".into()),
+            linker: Some("alpha-none-elf-gcc".into()),
             cpu: "ev56".into(),
             max_atomic_width: Some(64),
             panic_strategy: PanicStrategy::Abort,
