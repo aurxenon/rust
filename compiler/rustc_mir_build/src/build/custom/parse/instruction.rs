@@ -61,11 +61,9 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
                 })
             },
             @call("mir_call", args) => {
-                let destination = self.parse_place(args[0])?;
-                let target = self.parse_block(args[1])?;
-                self.parse_call(args[2], destination, target)
+                self.parse_call(args)
             },
-            ExprKind::Match { scrutinee, arms } => {
+            ExprKind::Match { scrutinee, arms, .. } => {
                 let discr = self.parse_operand(*scrutinee)?;
                 self.parse_match(arms, expr.span).map(|t| TerminatorKind::SwitchInt { discr, targets: t })
             },
@@ -78,7 +76,7 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
                 span,
                 item_description: "no arms".to_string(),
                 expected: "at least one arm".to_string(),
-            })
+            });
         };
 
         let otherwise = &self.thir[*otherwise];
@@ -87,7 +85,7 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
                 span: otherwise.span,
                 item_description: format!("{:?}", otherwise.pattern.kind),
                 expected: "wildcard pattern".to_string(),
-            })
+            });
         };
         let otherwise = self.parse_block(otherwise.body)?;
 
@@ -100,7 +98,7 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
                     span: arm.pattern.span,
                     item_description: format!("{:?}", arm.pattern.kind),
                     expected: "constant pattern".to_string(),
-                })
+                });
             };
             values.push(value.eval_bits(self.tcx, self.param_env, arm.pattern.ty));
             targets.push(self.parse_block(arm.body)?);
@@ -109,13 +107,14 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
         Ok(SwitchTargets::new(values.into_iter().zip(targets), otherwise))
     }
 
-    fn parse_call(
-        &self,
-        expr_id: ExprId,
-        destination: Place<'tcx>,
-        target: BasicBlock,
-    ) -> PResult<TerminatorKind<'tcx>> {
-        parse_by_kind!(self, expr_id, _, "function call",
+    fn parse_call(&self, args: &[ExprId]) -> PResult<TerminatorKind<'tcx>> {
+        let (destination, call) = parse_by_kind!(self, args[0], _, "function call",
+            ExprKind::Assign { lhs, rhs } => (*lhs, *rhs),
+        );
+        let destination = self.parse_place(destination)?;
+        let target = self.parse_block(args[1])?;
+
+        parse_by_kind!(self, call, _, "function call",
             ExprKind::Call { fun, args, from_hir_call, fn_span, .. } => {
                 let fun = self.parse_operand(*fun)?;
                 let args = args
@@ -128,7 +127,9 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
                     destination,
                     target: Some(target),
                     unwind: UnwindAction::Continue,
-                    from_hir_call: *from_hir_call,
+                    call_source: if *from_hir_call { CallSource::Normal } else {
+                        CallSource::OverloadedOperator
+                    },
                     fn_span: *fn_span,
                 })
             },
@@ -190,12 +191,12 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
                     fields.iter().map(|e| self.parse_operand(*e)).collect::<Result<_, _>>()?
                 ))
             },
-            ExprKind::Adt(box AdtExpr{ adt_def, variant_index, substs, fields, .. }) => {
+            ExprKind::Adt(box AdtExpr{ adt_def, variant_index, args, fields, .. }) => {
                 let is_union = adt_def.is_union();
                 let active_field_index = is_union.then(|| fields[0].name);
 
                 Ok(Rvalue::Aggregate(
-                    Box::new(AggregateKind::Adt(adt_def.did(), *variant_index, substs, None, active_field_index)),
+                    Box::new(AggregateKind::Adt(adt_def.did(), *variant_index, args, None, active_field_index)),
                     fields.iter().map(|f| self.parse_operand(f.expr)).collect::<Result<_, _>>()?
                 ))
             },
@@ -203,7 +204,7 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
         )
     }
 
-    fn parse_operand(&self, expr_id: ExprId) -> PResult<Operand<'tcx>> {
+    pub fn parse_operand(&self, expr_id: ExprId) -> PResult<Operand<'tcx>> {
         parse_by_kind!(self, expr_id, expr, "operand",
             @call("mir_move", args) => self.parse_place(args[0]).map(Operand::Move),
             @call("mir_static", args) => self.parse_static(args[0]),

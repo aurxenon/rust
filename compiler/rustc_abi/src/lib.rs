@@ -1,4 +1,5 @@
 #![cfg_attr(feature = "nightly", feature(step_trait, rustc_attrs, min_specialization))]
+#![cfg_attr(feature = "nightly", allow(internal_features))]
 
 use std::fmt;
 #[cfg(feature = "nightly")]
@@ -209,7 +210,7 @@ pub enum TargetDataLayoutErrors<'a> {
     InvalidAddressSpace { addr_space: &'a str, cause: &'a str, err: ParseIntError },
     InvalidBits { kind: &'a str, bit: &'a str, cause: &'a str, err: ParseIntError },
     MissingAlignment { cause: &'a str },
-    InvalidAlignment { cause: &'a str, err: String },
+    InvalidAlignment { cause: &'a str, err: AlignFromBytesError },
     InconsistentTargetArchitecture { dl: &'a str, target: &'a str },
     InconsistentTargetPointerWidth { pointer_size: u64, target: u32 },
     InvalidBitsSize { err: String },
@@ -332,7 +333,7 @@ impl TargetDataLayout {
             16 => 1 << 15,
             32 => 1 << 31,
             64 => 1 << 47,
-            bits => panic!("obj_size_bound: unknown pointer bit size {}", bits),
+            bits => panic!("obj_size_bound: unknown pointer bit size {bits}"),
         }
     }
 
@@ -342,7 +343,7 @@ impl TargetDataLayout {
             16 => I16,
             32 => I32,
             64 => I64,
-            bits => panic!("ptr_sized_integer: unknown pointer bit size {}", bits),
+            bits => panic!("ptr_sized_integer: unknown pointer bit size {bits}"),
         }
     }
 
@@ -399,7 +400,7 @@ impl FromStr for Endian {
         match s {
             "little" => Ok(Self::Little),
             "big" => Ok(Self::Big),
-            _ => Err(format!(r#"unknown endian: "{}""#, s)),
+            _ => Err(format!(r#"unknown endian: "{s}""#)),
         }
     }
 }
@@ -414,7 +415,9 @@ pub struct Size {
 // Safety: Ord is implement as just comparing numerical values and numerical values
 // are not changed by (de-)serialization.
 #[cfg(feature = "nightly")]
-unsafe impl StableOrd for Size {}
+unsafe impl StableOrd for Size {
+    const CAN_USE_UNSTABLE_SORT: bool = true;
+}
 
 // This is debug-printed a lot in larger structs, don't waste too much space there
 impl fmt::Debug for Size {
@@ -454,7 +457,7 @@ impl Size {
     pub fn bits(self) -> u64 {
         #[cold]
         fn overflow(bytes: u64) -> ! {
-            panic!("Size::bits: {} bytes in bits doesn't fit in u64", bytes)
+            panic!("Size::bits: {bytes} bytes in bits doesn't fit in u64")
         }
 
         self.bytes().checked_mul(8).unwrap_or_else(|| overflow(self.bytes()))
@@ -640,30 +643,65 @@ impl fmt::Debug for Align {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum AlignFromBytesError {
+    NotPowerOfTwo(u64),
+    TooLarge(u64),
+}
+
+impl AlignFromBytesError {
+    pub fn diag_ident(self) -> &'static str {
+        match self {
+            Self::NotPowerOfTwo(_) => "not_power_of_two",
+            Self::TooLarge(_) => "too_large",
+        }
+    }
+
+    pub fn align(self) -> u64 {
+        let (Self::NotPowerOfTwo(align) | Self::TooLarge(align)) = self;
+        align
+    }
+}
+
+impl fmt::Debug for AlignFromBytesError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for AlignFromBytesError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AlignFromBytesError::NotPowerOfTwo(align) => write!(f, "`{align}` is not a power of 2"),
+            AlignFromBytesError::TooLarge(align) => write!(f, "`{align}` is too large"),
+        }
+    }
+}
+
 impl Align {
     pub const ONE: Align = Align { pow2: 0 };
     pub const MAX: Align = Align { pow2: 29 };
 
     #[inline]
-    pub fn from_bits(bits: u64) -> Result<Align, String> {
+    pub fn from_bits(bits: u64) -> Result<Align, AlignFromBytesError> {
         Align::from_bytes(Size::from_bits(bits).bytes())
     }
 
     #[inline]
-    pub fn from_bytes(align: u64) -> Result<Align, String> {
+    pub fn from_bytes(align: u64) -> Result<Align, AlignFromBytesError> {
         // Treat an alignment of 0 bytes like 1-byte alignment.
         if align == 0 {
             return Ok(Align::ONE);
         }
 
         #[cold]
-        fn not_power_of_2(align: u64) -> String {
-            format!("`{}` is not a power of 2", align)
+        fn not_power_of_2(align: u64) -> AlignFromBytesError {
+            AlignFromBytesError::NotPowerOfTwo(align)
         }
 
         #[cold]
-        fn too_large(align: u64) -> String {
-            format!("`{}` is too large", align)
+        fn too_large(align: u64) -> AlignFromBytesError {
+            AlignFromBytesError::TooLarge(align)
         }
 
         let tz = align.trailing_zeros();
@@ -1142,17 +1180,12 @@ impl FieldsShape {
                 unreachable!("FieldsShape::offset: `Primitive`s have no fields")
             }
             FieldsShape::Union(count) => {
-                assert!(
-                    i < count.get(),
-                    "tried to access field {} of union with {} fields",
-                    i,
-                    count
-                );
+                assert!(i < count.get(), "tried to access field {i} of union with {count} fields");
                 Size::ZERO
             }
             FieldsShape::Array { stride, count } => {
                 let i = u64::try_from(i).unwrap();
-                assert!(i < count);
+                assert!(i < count, "tried to access field {i} of array with {count} fields");
                 stride * i
             }
             FieldsShape::Arbitrary { ref offsets, .. } => offsets[FieldIdx::from_usize(i)],
@@ -1257,7 +1290,7 @@ impl Abi {
                 Primitive::Int(_, signed) => signed,
                 _ => false,
             },
-            _ => panic!("`is_signed` on non-scalar ABI {:?}", self),
+            _ => panic!("`is_signed` on non-scalar ABI {self:?}"),
         }
     }
 
@@ -1267,10 +1300,16 @@ impl Abi {
         matches!(*self, Abi::Uninhabited)
     }
 
-    /// Returns `true` is this is a scalar type
+    /// Returns `true` if this is a scalar type
     #[inline]
     pub fn is_scalar(&self) -> bool {
         matches!(*self, Abi::Scalar(_))
+    }
+
+    /// Returns `true` if this is a bool
+    #[inline]
+    pub fn is_bool(&self) -> bool {
+        matches!(*self, Abi::Scalar(s) if s.is_bool())
     }
 
     /// Returns the fixed alignment of this ABI, if any is mandated.
@@ -1308,12 +1347,28 @@ impl Abi {
 
     /// Discard validity range information and allow undef.
     pub fn to_union(&self) -> Self {
-        assert!(self.is_sized());
         match *self {
             Abi::Scalar(s) => Abi::Scalar(s.to_union()),
             Abi::ScalarPair(s1, s2) => Abi::ScalarPair(s1.to_union(), s2.to_union()),
             Abi::Vector { element, count } => Abi::Vector { element: element.to_union(), count },
             Abi::Uninhabited | Abi::Aggregate { .. } => Abi::Aggregate { sized: true },
+        }
+    }
+
+    pub fn eq_up_to_validity(&self, other: &Self) -> bool {
+        match (self, other) {
+            // Scalar, Vector, ScalarPair have `Scalar` in them where we ignore validity ranges.
+            // We do *not* ignore the sign since it matters for some ABIs (e.g. s390x).
+            (Abi::Scalar(l), Abi::Scalar(r)) => l.primitive() == r.primitive(),
+            (
+                Abi::Vector { element: element_l, count: count_l },
+                Abi::Vector { element: element_r, count: count_r },
+            ) => element_l.primitive() == element_r.primitive() && count_l == count_r,
+            (Abi::ScalarPair(l1, l2), Abi::ScalarPair(r1, r2)) => {
+                l1.primitive() == r1.primitive() && l2.primitive() == r2.primitive()
+            }
+            // Everything else must be strictly identical.
+            _ => self == other,
         }
     }
 }
@@ -1494,6 +1549,16 @@ pub struct LayoutS {
 
     pub align: AbiAndPrefAlign,
     pub size: Size,
+
+    /// The largest alignment explicitly requested with `repr(align)` on this type or any field.
+    /// Only used on i686-windows, where the argument passing ABI is different when alignment is
+    /// requested, even if the requested alignment is equal to the natural alignment.
+    pub max_repr_align: Option<Align>,
+
+    /// The alignment the type would have, ignoring any `repr(align)` but including `repr(packed)`.
+    /// Only used on aarch64-linux, where the argument passing ABI ignores the requested alignment
+    /// in some cases.
+    pub unadjusted_abi_align: Align,
 }
 
 impl LayoutS {
@@ -1508,6 +1573,8 @@ impl LayoutS {
             largest_niche,
             size,
             align,
+            max_repr_align: None,
+            unadjusted_abi_align: align.abi,
         }
     }
 }
@@ -1517,7 +1584,16 @@ impl fmt::Debug for LayoutS {
         // This is how `Layout` used to print before it become
         // `Interned<LayoutS>`. We print it like this to avoid having to update
         // expected output in a lot of tests.
-        let LayoutS { size, align, abi, fields, largest_niche, variants } = self;
+        let LayoutS {
+            size,
+            align,
+            abi,
+            fields,
+            largest_niche,
+            variants,
+            max_repr_align,
+            unadjusted_abi_align,
+        } = self;
         f.debug_struct("Layout")
             .field("size", size)
             .field("align", align)
@@ -1525,6 +1601,8 @@ impl fmt::Debug for LayoutS {
             .field("fields", fields)
             .field("largest_niche", largest_niche)
             .field("variants", variants)
+            .field("max_repr_align", max_repr_align)
+            .field("unadjusted_abi_align", unadjusted_abi_align)
             .finish()
     }
 }
@@ -1565,6 +1643,14 @@ impl<'a> Layout<'a> {
         self.0.0.size
     }
 
+    pub fn max_repr_align(self) -> Option<Align> {
+        self.0.0.max_repr_align
+    }
+
+    pub fn unadjusted_abi_align(self) -> Align {
+        self.0.0.unadjusted_abi_align
+    }
+
     /// Whether the layout is from a type that implements [`std::marker::PointerLike`].
     ///
     /// Currently, that means that the type is pointer-sized, pointer-aligned,
@@ -1597,21 +1683,47 @@ pub struct PointeeInfo {
 
 impl LayoutS {
     /// Returns `true` if the layout corresponds to an unsized type.
+    #[inline]
     pub fn is_unsized(&self) -> bool {
         self.abi.is_unsized()
     }
 
+    #[inline]
     pub fn is_sized(&self) -> bool {
         self.abi.is_sized()
     }
 
+    /// Returns `true` if the type is sized and a 1-ZST (meaning it has size 0 and alignment 1).
+    pub fn is_1zst(&self) -> bool {
+        self.is_sized() && self.size.bytes() == 0 && self.align.abi.bytes() == 1
+    }
+
     /// Returns `true` if the type is a ZST and not unsized.
+    ///
+    /// Note that this does *not* imply that the type is irrelevant for layout! It can still have
+    /// non-trivial alignment constraints. You probably want to use `is_1zst` instead.
     pub fn is_zst(&self) -> bool {
         match self.abi {
             Abi::Scalar(_) | Abi::ScalarPair(..) | Abi::Vector { .. } => false,
             Abi::Uninhabited => self.size.bytes() == 0,
             Abi::Aggregate { sized } => sized && self.size.bytes() == 0,
         }
+    }
+
+    /// Checks if these two `Layout` are equal enough to be considered "the same for all function
+    /// call ABIs". Note however that real ABIs depend on more details that are not reflected in the
+    /// `Layout`; the `PassMode` need to be compared as well.
+    pub fn eq_abi(&self, other: &Self) -> bool {
+        // The one thing that we are not capturing here is that for unsized types, the metadata must
+        // also have the same ABI, and moreover that the same metadata leads to the same size. The
+        // 2nd point is quite hard to check though.
+        self.size == other.size
+            && self.is_sized() == other.is_sized()
+            && self.abi.eq_up_to_validity(&other.abi)
+            && self.abi.is_bool() == other.abi.is_bool()
+            && self.align.abi == other.align.abi
+            && self.max_repr_align == other.max_repr_align
+            && self.unadjusted_abi_align == other.unadjusted_abi_align
     }
 }
 

@@ -4,12 +4,11 @@
 
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::Applicability;
-use rustc_hir::{Expr, ExprKind};
+use rustc_hir::{BlockCheckMode, Expr, ExprKind, UnsafeSource};
 use rustc_lint::{LateContext, LintContext};
 use rustc_session::Session;
 use rustc_span::source_map::{original_sp, SourceMap};
-use rustc_span::{hygiene, SourceFile};
-use rustc_span::{BytePos, Pos, Span, SpanData, SyntaxContext, DUMMY_SP};
+use rustc_span::{hygiene, BytePos, SourceFileAndLine, Pos, SourceFile, Span, SpanData, SyntaxContext, DUMMY_SP};
 use std::borrow::Cow;
 use std::ops::Range;
 
@@ -71,11 +70,16 @@ pub fn expr_block<T: LintContext>(
     app: &mut Applicability,
 ) -> String {
     let (code, from_macro) = snippet_block_with_context(cx, expr.span, outer, default, indent_relative_to, app);
-    if from_macro {
-        format!("{{ {code} }}")
-    } else if let ExprKind::Block(_, _) = expr.kind {
+    if !from_macro &&
+        let ExprKind::Block(block, _) = expr.kind &&
+        block.rules != BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided)
+    {
         format!("{code}")
     } else {
+        // FIXME: add extra indent for the unsafe blocks:
+        //     original code:   unsafe { ... }
+        //     result code:     { unsafe { ... } }
+        //     desired code:    {\n  unsafe { ... }\n}
         format!("{{ {code} }}")
     }
 }
@@ -113,9 +117,9 @@ fn first_char_in_first_line<T: LintContext>(cx: &T, span: Span) -> Option<BytePo
 /// ```
 fn line_span<T: LintContext>(cx: &T, span: Span) -> Span {
     let span = original_sp(span, DUMMY_SP);
-    let source_map_and_line = cx.sess().source_map().lookup_line(span.lo()).unwrap();
-    let line_no = source_map_and_line.line;
-    let line_start = source_map_and_line.sf.lines(|lines| lines[line_no]);
+    let SourceFileAndLine { sf, line } = cx.sess().source_map().lookup_line(span.lo()).unwrap();
+    let line_start = sf.lines()[line];
+    let line_start = sf.absolute_position(line_start);
     span.with_lo(line_start)
 }
 

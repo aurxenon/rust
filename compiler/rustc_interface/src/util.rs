@@ -11,16 +11,16 @@ use rustc_parse::validate_attr;
 use rustc_session as session;
 use rustc_session::config::CheckCfg;
 use rustc_session::config::{self, CrateType};
-use rustc_session::config::{ErrorOutputType, OutputFilenames};
+use rustc_session::config::{OutFileName, OutputFilenames, OutputTypes};
 use rustc_session::filesearch::sysroot_candidates;
 use rustc_session::lint::{self, BuiltinLintDiagnostics, LintBuffer};
 use rustc_session::parse::CrateConfig;
-use rustc_session::{early_error, filesearch, output, Session};
+use rustc_session::{filesearch, output, Session};
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::edition::Edition;
 use rustc_span::source_map::FileLoader;
 use rustc_span::symbol::{sym, Symbol};
-use session::CompilerIO;
+use session::{CompilerIO, EarlyErrorHandler};
 use std::env;
 use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
 use std::mem;
@@ -58,6 +58,7 @@ pub fn add_configuration(
 }
 
 pub fn create_session(
+    handler: &EarlyErrorHandler,
     sopts: config::Options,
     cfg: FxHashSet<(String, Option<String>)>,
     check_cfg: CheckCfg,
@@ -69,11 +70,17 @@ pub fn create_session(
         Box<dyn FnOnce(&config::Options) -> Box<dyn CodegenBackend> + Send>,
     >,
     descriptions: Registry,
+    ice_file: Option<PathBuf>,
+    expanded_args: Vec<String>,
 ) -> (Session, Box<dyn CodegenBackend>) {
     let codegen_backend = if let Some(make_codegen_backend) = make_codegen_backend {
         make_codegen_backend(&sopts)
     } else {
-        get_codegen_backend(&sopts.maybe_sysroot, sopts.unstable_opts.codegen_backend.as_deref())
+        get_codegen_backend(
+            handler,
+            &sopts.maybe_sysroot,
+            sopts.unstable_opts.codegen_backend.as_deref(),
+        )
     };
 
     // target_override is documented to be called before init(), so this is okay
@@ -88,7 +95,7 @@ pub fn create_session(
     ) {
         Ok(bundle) => bundle,
         Err(e) => {
-            early_error(sopts.error_format, format!("failed to load fluent bundle: {e}"));
+            handler.early_error(format!("failed to load fluent bundle: {e}"));
         }
     };
 
@@ -96,6 +103,7 @@ pub fn create_session(
     locale_resources.push(codegen_backend.locale_resource());
 
     let mut sess = session::build_session(
+        handler,
         sopts,
         io,
         bundle,
@@ -105,6 +113,8 @@ pub fn create_session(
         file_loader,
         target_override,
         rustc_version_str().unwrap_or("unknown"),
+        ice_file,
+        expanded_args,
     );
 
     codegen_backend.init(&sess);
@@ -129,10 +139,8 @@ fn get_stack_size() -> Option<usize> {
     env::var_os("RUST_MIN_STACK").is_none().then_some(STACK_SIZE)
 }
 
-#[cfg(not(parallel_compiler))]
-pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce() -> R + Send, R: Send>(
+pub(crate) fn run_in_thread_with_globals<F: FnOnce() -> R + Send, R: Send>(
     edition: Edition,
-    _threads: usize,
     f: F,
 ) -> R {
     // The "thread pool" is a single spawned thread in the non-parallel
@@ -163,18 +171,37 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce() -> R + Send, R: Send>(
     })
 }
 
+#[cfg(not(parallel_compiler))]
+pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce() -> R + Send, R: Send>(
+    edition: Edition,
+    _threads: usize,
+    f: F,
+) -> R {
+    run_in_thread_with_globals(edition, f)
+}
+
 #[cfg(parallel_compiler)]
 pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce() -> R + Send, R: Send>(
     edition: Edition,
     threads: usize,
     f: F,
 ) -> R {
-    use rustc_data_structures::jobserver;
+    use rustc_data_structures::{jobserver, sync::FromDyn};
     use rustc_middle::ty::tls;
     use rustc_query_impl::QueryCtxt;
     use rustc_query_system::query::{deadlock, QueryContext};
 
     let registry = sync::Registry::new(threads);
+
+    if !sync::is_dyn_thread_safe() {
+        return run_in_thread_with_globals(edition, || {
+            // Register the thread for use with the `WorkerLocal` type.
+            registry.register();
+
+            f()
+        });
+    }
+
     let mut builder = rayon::ThreadPoolBuilder::new()
         .thread_name(|_| "rustc".to_string())
         .acquire_thread_handler(jobserver::acquire_thread)
@@ -183,13 +210,13 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce() -> R + Send, R: Send>(
         .deadlock_handler(|| {
             // On deadlock, creates a new thread and forwards information in thread
             // locals to it. The new thread runs the deadlock handler.
-            let query_map = tls::with(|tcx| {
+            let query_map = FromDyn::from(tls::with(|tcx| {
                 QueryCtxt::new(tcx)
                     .try_collect_active_jobs()
                     .expect("active jobs shouldn't be locked in deadlock handler")
-            });
+            }));
             let registry = rayon_core::Registry::current();
-            thread::spawn(move || deadlock(query_map, &registry));
+            thread::spawn(move || deadlock(query_map.into_inner(), &registry));
         });
     if let Some(size) = get_stack_size() {
         builder = builder.stack_size(size);
@@ -201,6 +228,7 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce() -> R + Send, R: Send>(
     // `Send` in the parallel compiler.
     rustc_span::create_session_globals_then(edition, || {
         rustc_span::with_session_globals(|session_globals| {
+            let session_globals = FromDyn::from(session_globals);
             builder
                 .build_scoped(
                     // Initialize each new worker thread when created.
@@ -208,7 +236,9 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce() -> R + Send, R: Send>(
                         // Register the thread for use with the `WorkerLocal` type.
                         registry.register();
 
-                        rustc_span::set_session_globals_then(session_globals, || thread.run())
+                        rustc_span::set_session_globals_then(session_globals.into_inner(), || {
+                            thread.run()
+                        })
                     },
                     // Run `f` on the first thread in the thread pool.
                     move |pool: &rayon::ThreadPool| pool.install(f),
@@ -218,16 +248,16 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce() -> R + Send, R: Send>(
     })
 }
 
-fn load_backend_from_dylib(path: &Path) -> MakeBackendFn {
+fn load_backend_from_dylib(handler: &EarlyErrorHandler, path: &Path) -> MakeBackendFn {
     let lib = unsafe { Library::new(path) }.unwrap_or_else(|err| {
         let err = format!("couldn't load codegen backend {path:?}: {err}");
-        early_error(ErrorOutputType::default(), err);
+        handler.early_error(err);
     });
 
     let backend_sym = unsafe { lib.get::<MakeBackendFn>(b"__rustc_codegen_backend") }
         .unwrap_or_else(|e| {
             let err = format!("couldn't load codegen backend: {e}");
-            early_error(ErrorOutputType::default(), err);
+            handler.early_error(err);
         });
 
     // Intentionally leak the dynamic library. We can't ever unload it
@@ -242,6 +272,7 @@ fn load_backend_from_dylib(path: &Path) -> MakeBackendFn {
 ///
 /// A name of `None` indicates that the default backend should be used.
 pub fn get_codegen_backend(
+    handler: &EarlyErrorHandler,
     maybe_sysroot: &Option<PathBuf>,
     backend_name: Option<&str>,
 ) -> Box<dyn CodegenBackend> {
@@ -251,10 +282,12 @@ pub fn get_codegen_backend(
         let default_codegen_backend = option_env!("CFG_DEFAULT_CODEGEN_BACKEND").unwrap_or("llvm");
 
         match backend_name.unwrap_or(default_codegen_backend) {
-            filename if filename.contains('.') => load_backend_from_dylib(filename.as_ref()),
+            filename if filename.contains('.') => {
+                load_backend_from_dylib(handler, filename.as_ref())
+            }
             #[cfg(feature = "llvm")]
             "llvm" => rustc_codegen_llvm::LlvmCodegenBackend::new,
-            backend_name => get_codegen_sysroot(maybe_sysroot, backend_name),
+            backend_name => get_codegen_sysroot(handler, maybe_sysroot, backend_name),
         }
     });
 
@@ -286,7 +319,11 @@ fn get_rustc_path_inner(bin_path: &str) -> Option<PathBuf> {
     })
 }
 
-fn get_codegen_sysroot(maybe_sysroot: &Option<PathBuf>, backend_name: &str) -> MakeBackendFn {
+fn get_codegen_sysroot(
+    handler: &EarlyErrorHandler,
+    maybe_sysroot: &Option<PathBuf>,
+    backend_name: &str,
+) -> MakeBackendFn {
     // For now we only allow this function to be called once as it'll dlopen a
     // few things, which seems to work best if we only do that once. In
     // general this assertion never trips due to the once guard in `get_codegen_backend`,
@@ -321,7 +358,7 @@ fn get_codegen_sysroot(maybe_sysroot: &Option<PathBuf>, backend_name: &str) -> M
             "failed to find a `codegen-backends` folder \
                            in the sysroot candidates:\n* {candidates}"
         );
-        early_error(ErrorOutputType::default(), err);
+        handler.early_error(err);
     });
     info!("probing {} for a codegen backend", sysroot.display());
 
@@ -332,7 +369,7 @@ fn get_codegen_sysroot(maybe_sysroot: &Option<PathBuf>, backend_name: &str) -> M
             sysroot.display(),
             e
         );
-        early_error(ErrorOutputType::default(), err);
+        handler.early_error(err);
     });
 
     let mut file: Option<PathBuf> = None;
@@ -360,16 +397,16 @@ fn get_codegen_sysroot(maybe_sysroot: &Option<PathBuf>, backend_name: &str) -> M
                 prev.display(),
                 path.display()
             );
-            early_error(ErrorOutputType::default(), err);
+            handler.early_error(err);
         }
         file = Some(path.clone());
     }
 
     match file {
-        Some(ref s) => load_backend_from_dylib(s),
+        Some(ref s) => load_backend_from_dylib(handler, s),
         None => {
             let err = format!("unsupported builtin codegen backend `{backend_name}`");
-            early_error(ErrorOutputType::default(), err);
+            handler.early_error(err);
         }
     }
 }
@@ -500,7 +537,37 @@ pub fn collect_crate_types(session: &Session, attrs: &[ast::Attribute]) -> Vec<C
     base
 }
 
+fn multiple_output_types_to_stdout(
+    output_types: &OutputTypes,
+    single_output_file_is_stdout: bool,
+) -> bool {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        // If stdout is a tty, check if multiple text output types are
+        // specified by `--emit foo=- --emit bar=-` or `-o - --emit foo,bar`
+        let named_text_types = output_types
+            .iter()
+            .filter(|(f, o)| f.is_text_output() && *o == &Some(OutFileName::Stdout))
+            .count();
+        let unnamed_text_types =
+            output_types.iter().filter(|(f, o)| f.is_text_output() && o.is_none()).count();
+        named_text_types > 1 || unnamed_text_types > 1 && single_output_file_is_stdout
+    } else {
+        // Otherwise, all the output types should be checked
+        let named_types =
+            output_types.values().filter(|o| *o == &Some(OutFileName::Stdout)).count();
+        let unnamed_types = output_types.values().filter(|o| o.is_none()).count();
+        named_types > 1 || unnamed_types > 1 && single_output_file_is_stdout
+    }
+}
+
 pub fn build_output_filenames(attrs: &[ast::Attribute], sess: &Session) -> OutputFilenames {
+    if multiple_output_types_to_stdout(
+        &sess.opts.output_types,
+        sess.io.output_file == Some(OutFileName::Stdout),
+    ) {
+        sess.emit_fatal(errors::MultipleOutputTypesToStdout);
+    }
     match sess.io.output_file {
         None => {
             // "-" as input file will cause the parser to read from stdin so we
@@ -544,7 +611,7 @@ pub fn build_output_filenames(attrs: &[ast::Attribute], sess: &Session) -> Outpu
 
             OutputFilenames::new(
                 out_file.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
-                out_file.file_stem().unwrap_or_default().to_str().unwrap().to_string(),
+                out_file.filestem().unwrap_or_default().to_str().unwrap().to_string(),
                 ofile,
                 sess.io.temps_dir.clone(),
                 sess.opts.cg.extra_filename.clone(),

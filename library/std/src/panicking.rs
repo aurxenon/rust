@@ -234,10 +234,21 @@ where
     *hook = Hook::Custom(Box::new(move |info| hook_fn(&prev, info)));
 }
 
+/// The default panic handler.
 fn default_hook(info: &PanicInfo<'_>) {
+    panic_hook_with_disk_dump(info, None)
+}
+
+#[unstable(feature = "ice_to_disk", issue = "none")]
+/// The implementation of the default panic handler.
+///
+/// It can also write the backtrace to a given `path`. This functionality is used only by `rustc`.
+pub fn panic_hook_with_disk_dump(info: &PanicInfo<'_>, path: Option<&crate::path::Path>) {
     // If this is a double panic, make sure that we print a backtrace
     // for this panic. Otherwise only print it if logging is enabled.
-    let backtrace = if panic_count::get_count() >= 2 {
+    let backtrace = if info.force_no_backtrace() {
+        None
+    } else if panic_count::get_count() >= 2 {
         BacktraceStyle::full()
     } else {
         crate::panic::get_backtrace_style()
@@ -256,8 +267,8 @@ fn default_hook(info: &PanicInfo<'_>) {
     let thread = thread_info::current_thread();
     let name = thread.as_ref().and_then(|t| t.name()).unwrap_or("<unnamed>");
 
-    let write = |err: &mut dyn crate::io::Write| {
-        let _ = writeln!(err, "thread '{name}' panicked at '{msg}', {location}");
+    let write = |err: &mut dyn crate::io::Write, backtrace: Option<BacktraceStyle>| {
+        let _ = writeln!(err, "thread '{name}' panicked at {location}:\n{msg}");
 
         static FIRST_PANIC: AtomicBool = AtomicBool::new(true);
 
@@ -270,22 +281,37 @@ fn default_hook(info: &PanicInfo<'_>) {
             }
             Some(BacktraceStyle::Off) => {
                 if FIRST_PANIC.swap(false, Ordering::SeqCst) {
-                    let _ = writeln!(
-                        err,
-                        "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
-                    );
+                    if let Some(path) = path {
+                        let _ = writeln!(
+                            err,
+                            "note: a backtrace for this error was stored at `{}`",
+                            path.display(),
+                        );
+                    } else {
+                        let _ = writeln!(
+                            err,
+                            "note: run with `RUST_BACKTRACE=1` environment variable to display a \
+                             backtrace"
+                        );
+                    }
                 }
             }
-            // If backtraces aren't supported, do nothing.
+            // If backtraces aren't supported or are forced-off, do nothing.
             None => {}
         }
     };
 
+    if let Some(path) = path
+        && let Ok(mut out) = crate::fs::File::options().create(true).append(true).open(&path)
+    {
+        write(&mut out, BacktraceStyle::full());
+    }
+
     if let Some(local) = set_output_capture(None) {
-        write(&mut *local.lock().unwrap_or_else(|e| e.into_inner()));
+        write(&mut *local.lock().unwrap_or_else(|e| e.into_inner()), backtrace);
         set_output_capture(Some(local));
     } else if let Some(mut out) = panic_output() {
-        write(&mut out);
+        write(&mut out, backtrace);
     }
 }
 
@@ -591,14 +617,23 @@ pub fn begin_panic_handler(info: &PanicInfo<'_>) -> ! {
     let loc = info.location().unwrap(); // The current implementation always returns Some
     let msg = info.message().unwrap(); // The current implementation always returns Some
     crate::sys_common::backtrace::__rust_end_short_backtrace(move || {
+        // FIXME: can we just pass `info` along rather than taking it apart here, only to have
+        // `rust_panic_with_hook` construct a new `PanicInfo`?
         if let Some(msg) = msg.as_str() {
-            rust_panic_with_hook(&mut StrPanicPayload(msg), info.message(), loc, info.can_unwind());
+            rust_panic_with_hook(
+                &mut StrPanicPayload(msg),
+                info.message(),
+                loc,
+                info.can_unwind(),
+                info.force_no_backtrace(),
+            );
         } else {
             rust_panic_with_hook(
                 &mut PanicPayload::new(msg),
                 info.message(),
                 loc,
                 info.can_unwind(),
+                info.force_no_backtrace(),
             );
         }
     })
@@ -623,7 +658,13 @@ pub const fn begin_panic<M: Any + Send>(msg: M) -> ! {
 
     let loc = Location::caller();
     return crate::sys_common::backtrace::__rust_end_short_backtrace(move || {
-        rust_panic_with_hook(&mut PanicPayload::new(msg), None, loc, true)
+        rust_panic_with_hook(
+            &mut PanicPayload::new(msg),
+            None,
+            loc,
+            /* can_unwind */ true,
+            /* force_no_backtrace */ false,
+        )
     });
 
     struct PanicPayload<A> {
@@ -669,6 +710,7 @@ fn rust_panic_with_hook(
     message: Option<&fmt::Arguments<'_>>,
     location: &Location<'_>,
     can_unwind: bool,
+    force_no_backtrace: bool,
 ) -> ! {
     let must_abort = panic_count::increase(true);
 
@@ -683,14 +725,20 @@ fn rust_panic_with_hook(
             panic_count::MustAbort::AlwaysAbort => {
                 // Unfortunately, this does not print a backtrace, because creating
                 // a `Backtrace` will allocate, which we must to avoid here.
-                let panicinfo = PanicInfo::internal_constructor(message, location, can_unwind);
+                let panicinfo = PanicInfo::internal_constructor(
+                    message,
+                    location,
+                    can_unwind,
+                    force_no_backtrace,
+                );
                 rtprintpanic!("{panicinfo}\npanicked after panic::always_abort(), aborting.\n");
             }
         }
         crate::sys::abort_internal();
     }
 
-    let mut info = PanicInfo::internal_constructor(message, location, can_unwind);
+    let mut info =
+        PanicInfo::internal_constructor(message, location, can_unwind, force_no_backtrace);
     let hook = HOOK.read().unwrap_or_else(PoisonError::into_inner);
     match *hook {
         // Some platforms (like wasm) know that printing to stderr won't ever actually

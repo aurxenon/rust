@@ -7,11 +7,11 @@
 
 use super::Pass;
 use crate::clean;
+use crate::clean::utils::inherits_doc_hidden;
 use crate::clean::*;
 use crate::core::DocContext;
 use crate::html::markdown::{find_testable_code, ErrorCodes, Ignore, LangString};
 use crate::visit::DocVisitor;
-use crate::visit_ast::inherits_doc_hidden;
 use rustc_hir as hir;
 use rustc_middle::lint::LintLevelSource;
 use rustc_session::lint;
@@ -60,7 +60,7 @@ pub(crate) fn should_have_doc_example(cx: &DocContext<'_>, item: &clean::Item) -
                 | clean::VariantItem(_)
                 | clean::AssocConstItem(..)
                 | clean::AssocTypeItem(..)
-                | clean::TypedefItem(_)
+                | clean::TypeAliasItem(_)
                 | clean::StaticItem(_)
                 | clean::ConstantItem(_)
                 | clean::ExternCrateItem { .. }
@@ -92,8 +92,8 @@ pub(crate) fn should_have_doc_example(cx: &DocContext<'_>, item: &clean::Item) -
         return false;
     }
 
-    if cx.tcx.is_doc_hidden(def_id.to_def_id())
-        || inherits_doc_hidden(cx.tcx, def_id, None)
+    if (!cx.render_options.document_hidden
+        && (cx.tcx.is_doc_hidden(def_id.to_def_id()) || inherits_doc_hidden(cx.tcx, def_id, None)))
         || cx.tcx.def_span(def_id.to_def_id()).in_derive_expansion()
     {
         return false;
@@ -106,8 +106,7 @@ pub(crate) fn should_have_doc_example(cx: &DocContext<'_>, item: &clean::Item) -
 }
 
 pub(crate) fn look_for_tests<'tcx>(cx: &DocContext<'tcx>, dox: &str, item: &Item) {
-    let Some(hir_id) = DocContext::as_local_hir_id(cx.tcx, item.item_id)
-    else {
+    let Some(hir_id) = DocContext::as_local_hir_id(cx.tcx, item.item_id) else {
         // If non-local, no need to check anything.
         return;
     };
@@ -118,7 +117,7 @@ pub(crate) fn look_for_tests<'tcx>(cx: &DocContext<'tcx>, dox: &str, item: &Item
 
     if tests.found_tests == 0 && cx.tcx.features().rustdoc_missing_doc_code_examples {
         if should_have_doc_example(cx, item) {
-            debug!("reporting error for {:?} (hir_id={:?})", item, hir_id);
+            debug!("reporting error for {item:?} (hir_id={hir_id:?})");
             let sp = item.attr_span(cx.tcx);
             cx.tcx.struct_span_lint_hir(
                 crate::lint::MISSING_DOC_CODE_EXAMPLES,

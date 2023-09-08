@@ -1108,6 +1108,41 @@ fn function() {
 }
 
 #[test]
+fn flyimport_pattern_no_unstable_item_on_stable() {
+    check(
+        r#"
+//- /main.rs crate:main deps:std
+fn function() {
+    let foo$0
+}
+//- /std.rs crate:std
+#[unstable]
+pub struct FooStruct {}
+"#,
+        expect![""],
+    );
+}
+
+#[test]
+fn flyimport_pattern_unstable_item_on_nightly() {
+    check(
+        r#"
+//- toolchain:nightly
+//- /main.rs crate:main deps:std
+fn function() {
+    let foo$0
+}
+//- /std.rs crate:std
+#[unstable]
+pub struct FooStruct {}
+"#,
+        expect![[r#"
+            st FooStruct (use std::FooStruct)
+        "#]],
+    );
+}
+
+#[test]
 fn flyimport_item_name() {
     check(
         r#"
@@ -1227,6 +1262,81 @@ macro_rules! define_struct {
 "#,
         expect![[r#"
             ma define_struct!(…) (use dep::define_struct) macro_rules! define_struct
+        "#]],
+    );
+}
+
+#[test]
+fn macro_use_prelude_is_in_scope() {
+    check(
+        r#"
+//- /main.rs crate:main deps:dep
+#[macro_use]
+extern crate dep;
+
+fn main() {
+    print$0
+}
+//- /lib.rs crate:dep
+#[macro_export]
+macro_rules! println {
+    () => {}
+}
+"#,
+        expect![""],
+    )
+}
+
+#[test]
+fn no_completions_for_external_doc_hidden_in_path() {
+    check(
+        r#"
+//- /main.rs crate:main deps:dep
+fn main() {
+    Span$0
+}
+//- /lib.rs crate:dep
+#[doc(hidden)]
+pub mod bridge {
+    pub mod server {
+        pub trait Span
+    }
+}
+pub mod bridge2 {
+    #[doc(hidden)]
+    pub mod server2 {
+        pub trait Span
+    }
+}
+"#,
+        expect![""],
+    );
+    // unless re-exported
+    check(
+        r#"
+//- /main.rs crate:main deps:dep
+fn main() {
+    Span$0
+}
+//- /lib.rs crate:dep
+#[doc(hidden)]
+pub mod bridge {
+    pub mod server {
+        pub trait Span
+    }
+}
+pub use bridge::server::Span;
+pub mod bridge2 {
+    #[doc(hidden)]
+    pub mod server2 {
+        pub trait Span2
+    }
+}
+pub use bridge2::server2::Span2;
+"#,
+        expect![[r#"
+            tt Span (use dep::Span)
+            tt Span2 (use dep::Span2)
         "#]],
     );
 }

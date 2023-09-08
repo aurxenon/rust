@@ -7,6 +7,7 @@ use crate::errors::*;
 
 use rustc_arena::TypedArena;
 use rustc_ast::Mutability;
+use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_errors::{
     struct_span_err, Applicability, Diagnostic, DiagnosticBuilder, ErrorGuaranteed, MultiSpan,
@@ -135,10 +136,12 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for MatchVisitor<'a, '_, 'tcx> {
                 });
                 return;
             }
-            ExprKind::Match { scrutinee, box ref arms } => {
+            ExprKind::Match { scrutinee, scrutinee_hir_id, box ref arms } => {
                 let source = match ex.span.desugaring_kind() {
                     Some(DesugaringKind::ForLoop) => hir::MatchSource::ForLoopDesugar,
-                    Some(DesugaringKind::QuestionMark) => hir::MatchSource::TryDesugar,
+                    Some(DesugaringKind::QuestionMark) => {
+                        hir::MatchSource::TryDesugar(scrutinee_hir_id)
+                    }
                     Some(DesugaringKind::Await) => hir::MatchSource::AwaitDesugar,
                     _ => hir::MatchSource::Normal,
                 };
@@ -277,7 +280,7 @@ impl<'p, 'tcx> MatchVisitor<'_, 'p, 'tcx> {
             | hir::MatchSource::FormatArgs => report_arm_reachability(&cx, &report),
             // Unreachable patterns in try and await expressions occur when one of
             // the arms are an uninhabited type. Which is OK.
-            hir::MatchSource::AwaitDesugar | hir::MatchSource::TryDesugar => {}
+            hir::MatchSource::AwaitDesugar | hir::MatchSource::TryDesugar(_) => {}
         }
 
         // Check if the match is exhaustive.
@@ -443,7 +446,12 @@ impl<'p, 'tcx> MatchVisitor<'_, 'p, 'tcx> {
         let mut let_suggestion = None;
         let mut misc_suggestion = None;
         let mut interpreted_as_const = None;
-        if let PatKind::Constant { .. } = pat.kind
+
+        if let PatKind::Constant { .. }
+            | PatKind::AscribeUserType {
+                subpattern: box Pat { kind: PatKind::Constant { .. }, .. },
+                ..
+              } = pat.kind
             && let Ok(snippet) = self.tcx.sess.source_map().span_to_snippet(pat.span)
         {
             // If the pattern to match is an integer literal:
@@ -496,12 +504,12 @@ impl<'p, 'tcx> MatchVisitor<'_, 'p, 'tcx> {
         let witness_1_is_privately_uninhabited =
             if cx.tcx.features().exhaustive_patterns
                 && let Some(witness_1) = witnesses.get(0)
-                && let ty::Adt(adt, substs) = witness_1.ty().kind()
+                && let ty::Adt(adt, args) = witness_1.ty().kind()
                 && adt.is_enum()
                 && let Constructor::Variant(variant_index) = witness_1.ctor()
             {
                 let variant = adt.variant(*variant_index);
-                let inhabited = variant.inhabited_predicate(cx.tcx, *adt).subst(cx.tcx, substs);
+                let inhabited = variant.inhabited_predicate(cx.tcx, *adt).instantiate(cx.tcx, args);
                 assert!(inhabited.apply(cx.tcx, cx.param_env, cx.module));
                 !inhabited.apply_ignore_module(cx.tcx, cx.param_env)
             } else {
@@ -653,6 +661,17 @@ fn report_arm_reachability<'p, 'tcx>(
     }
 }
 
+fn collect_non_exhaustive_tys<'p, 'tcx>(
+    pat: &DeconstructedPat<'p, 'tcx>,
+    non_exhaustive_tys: &mut FxHashSet<Ty<'tcx>>,
+) {
+    if matches!(pat.ctor(), Constructor::NonExhaustive) {
+        non_exhaustive_tys.insert(pat.ty());
+    }
+    pat.iter_fields()
+        .for_each(|field_pat| collect_non_exhaustive_tys(field_pat, non_exhaustive_tys))
+}
+
 /// Report that a match is not exhaustive.
 fn non_exhaustive_match<'p, 'tcx>(
     cx: &MatchCheckCtxt<'p, 'tcx>,
@@ -686,7 +705,7 @@ fn non_exhaustive_match<'p, 'tcx>(
         err = create_e0004(
             cx.tcx.sess,
             sp,
-            format!("non-exhaustive patterns: {} not covered", joined_patterns),
+            format!("non-exhaustive patterns: {joined_patterns} not covered"),
         );
         err.span_label(sp, pattern_not_covered_label(&witnesses, &joined_patterns));
         patterns_len = witnesses.len();
@@ -701,33 +720,35 @@ fn non_exhaustive_match<'p, 'tcx>(
         };
     };
 
-    let is_variant_list_non_exhaustive = matches!(scrut_ty.kind(),
-        ty::Adt(def, _) if def.is_variant_list_non_exhaustive() && !def.did().is_local());
-
     adt_defined_here(cx, &mut err, scrut_ty, &witnesses);
-    err.note(format!(
-        "the matched value is of type `{}`{}",
-        scrut_ty,
-        if is_variant_list_non_exhaustive { ", which is marked as non-exhaustive" } else { "" }
-    ));
-    if (scrut_ty == cx.tcx.types.usize || scrut_ty == cx.tcx.types.isize)
-        && !is_empty_match
-        && witnesses.len() == 1
-        && matches!(witnesses[0].ctor(), Constructor::NonExhaustive)
-    {
-        err.note(format!(
-            "`{}` does not have a fixed maximum value, so a wildcard `_` is necessary to match \
-             exhaustively",
-            scrut_ty,
-        ));
-        if cx.tcx.sess.is_nightly_build() {
-            err.help(format!(
-                "add `#![feature(precise_pointer_size_matching)]` to the crate attributes to \
-                 enable precise `{}` matching",
-                scrut_ty,
-            ));
+    err.note(format!("the matched value is of type `{}`", scrut_ty));
+
+    if !is_empty_match && witnesses.len() == 1 {
+        let mut non_exhaustive_tys = FxHashSet::default();
+        collect_non_exhaustive_tys(&witnesses[0], &mut non_exhaustive_tys);
+
+        for ty in non_exhaustive_tys {
+            if ty.is_ptr_sized_integral() {
+                err.note(format!(
+                    "`{ty}` does not have a fixed maximum value, so a wildcard `_` is necessary to match \
+                         exhaustively",
+                    ));
+                if cx.tcx.sess.is_nightly_build() {
+                    err.help(format!(
+                            "add `#![feature(precise_pointer_size_matching)]` to the crate attributes to \
+                             enable precise `{ty}` matching",
+                        ));
+                }
+            } else if ty == cx.tcx.types.str_ {
+                err.note(format!(
+                    "`&str` cannot be matched exhaustively, so a wildcard `_` is necessary",
+                ));
+            } else if cx.is_foreign_non_exhaustive_enum(ty) {
+                err.note(format!("`{ty}` is marked as non-exhaustive, so a wildcard `_` is necessary to match exhaustively"));
+            }
         }
     }
+
     if let ty::Ref(_, sub_ty, _) = scrut_ty.kind() {
         if !sub_ty.is_inhabited_from(cx.tcx, cx.module, cx.param_env) {
             err.note("references are always considered inhabited");
@@ -740,18 +761,13 @@ fn non_exhaustive_match<'p, 'tcx>(
         [] if sp.eq_ctxt(expr_span) => {
             // Get the span for the empty match body `{}`.
             let (indentation, more) = if let Some(snippet) = sm.indentation_before(sp) {
-                (format!("\n{}", snippet), "    ")
+                (format!("\n{snippet}"), "    ")
             } else {
                 (" ".to_string(), "")
             };
             suggestion = Some((
                 sp.shrink_to_hi().with_hi(expr_span.hi()),
-                format!(
-                    " {{{indentation}{more}{pattern} => todo!(),{indentation}}}",
-                    indentation = indentation,
-                    more = more,
-                    pattern = pattern,
-                ),
+                format!(" {{{indentation}{more}{pattern} => todo!(),{indentation}}}",),
             ));
         }
         [only] => {
@@ -760,7 +776,7 @@ fn non_exhaustive_match<'p, 'tcx>(
                 && let Ok(with_trailing) = sm.span_extend_while(only.span, |c| c.is_whitespace() || c == ',')
                 && sm.is_multiline(with_trailing)
             {
-                (format!("\n{}", snippet), true)
+                (format!("\n{snippet}"), true)
             } else {
                 (" ".to_string(), false)
             };
@@ -775,7 +791,7 @@ fn non_exhaustive_match<'p, 'tcx>(
             };
             suggestion = Some((
                 only.span.shrink_to_hi(),
-                format!("{}{}{} => todo!()", comma, pre_indentation, pattern),
+                format!("{comma}{pre_indentation}{pattern} => todo!()"),
             ));
         }
         [.., prev, last] => {
@@ -798,7 +814,7 @@ fn non_exhaustive_match<'p, 'tcx>(
                 if let Some(spacing) = spacing {
                     suggestion = Some((
                         last.span.shrink_to_hi(),
-                        format!("{}{}{} => todo!()", comma, spacing, pattern),
+                        format!("{comma}{spacing}{pattern} => todo!()"),
                     ));
                 }
             }
@@ -825,6 +841,11 @@ fn non_exhaustive_match<'p, 'tcx>(
             _ => " or multiple match arms",
         },
     );
+
+    let all_arms_have_guards = arms.iter().all(|arm_id| thir[*arm_id].guard.is_some());
+    if !is_empty_match && all_arms_have_guards {
+        err.subdiagnostic(NonExhaustiveMatchAllArmsGuarded);
+    }
     if let Some((span, sugg)) = suggestion {
         err.span_suggestion_verbose(span, msg, sugg, Applicability::HasPlaceholders);
     } else {
@@ -890,7 +911,7 @@ fn adt_defined_here<'p, 'tcx>(
         for pat in spans {
             span.push_span_label(pat, "not covered");
         }
-        err.span_note(span, format!("`{}` defined here", ty));
+        err.span_note(span, format!("`{ty}` defined here"));
     }
 }
 
@@ -932,7 +953,9 @@ fn maybe_point_at_variant<'a, 'p: 'a, 'tcx: 'a>(
 /// This analysis is *not* subsumed by NLL.
 fn check_borrow_conflicts_in_at_patterns<'tcx>(cx: &MatchVisitor<'_, '_, 'tcx>, pat: &Pat<'tcx>) {
     // Extract `sub` in `binding @ sub`.
-    let PatKind::Binding { name, mode, ty, subpattern: Some(box ref sub), .. } = pat.kind else { return };
+    let PatKind::Binding { name, mode, ty, subpattern: Some(box ref sub), .. } = pat.kind else {
+        return;
+    };
 
     let is_binding_by_move = |ty: Ty<'tcx>| !ty.is_copy_modulo_regions(cx.tcx, cx.param_env);
 

@@ -6,6 +6,7 @@
 #![feature(unwrap_infallible)]
 #![deny(rustc::untranslatable_diagnostic)]
 #![deny(rustc::diagnostic_outside_of_impl)]
+#![allow(internal_features)]
 
 #[macro_use]
 extern crate bitflags;
@@ -31,6 +32,7 @@ mod macros;
 mod structural_impls;
 
 pub use codec::*;
+pub use structural_impls::{DebugWithInfcx, InferCtxtLike, OptWithInfcx};
 pub use sty::*;
 pub use ty_info::*;
 
@@ -39,34 +41,45 @@ pub trait HashStableContext {}
 
 pub trait Interner: Sized {
     type AdtDef: Clone + Debug + Hash + Ord;
-    type SubstsRef: Clone + Debug + Hash + Ord;
+    type GenericArgsRef: Clone + DebugWithInfcx<Self> + Hash + Ord;
     type DefId: Clone + Debug + Hash + Ord;
     type Binder<T>;
-    type Ty: Clone + Debug + Hash + Ord;
-    type Const: Clone + Debug + Hash + Ord;
-    type Region: Clone + Debug + Hash + Ord;
+    type Ty: Clone + DebugWithInfcx<Self> + Hash + Ord;
+    type Const: Clone + DebugWithInfcx<Self> + Hash + Ord;
+    type Region: Clone + DebugWithInfcx<Self> + Hash + Ord;
     type Predicate;
     type TypeAndMut: Clone + Debug + Hash + Ord;
     type Mutability: Clone + Debug + Hash + Ord;
     type Movability: Clone + Debug + Hash + Ord;
-    type PolyFnSig: Clone + Debug + Hash + Ord;
-    type ListBinderExistentialPredicate: Clone + Debug + Hash + Ord;
-    type BinderListTy: Clone + Debug + Hash + Ord;
-    type ListTy: Clone + Debug + Hash + Ord;
-    type AliasTy: Clone + Debug + Hash + Ord;
+    type PolyFnSig: Clone + DebugWithInfcx<Self> + Hash + Ord;
+    type ListBinderExistentialPredicate: Clone + DebugWithInfcx<Self> + Hash + Ord;
+    type BinderListTy: Clone + DebugWithInfcx<Self> + Hash + Ord;
+    type ListTy: Clone + Debug + Hash + Ord + IntoIterator<Item = Self::Ty>;
+    type AliasTy: Clone + DebugWithInfcx<Self> + Hash + Ord;
     type ParamTy: Clone + Debug + Hash + Ord;
     type BoundTy: Clone + Debug + Hash + Ord;
     type PlaceholderType: Clone + Debug + Hash + Ord;
-    type InferTy: Clone + Debug + Hash + Ord;
+    type InferTy: Clone + DebugWithInfcx<Self> + Hash + Ord;
     type ErrorGuaranteed: Clone + Debug + Hash + Ord;
     type PredicateKind: Clone + Debug + Hash + PartialEq + Eq;
     type AllocId: Clone + Debug + Hash + Ord;
 
+    type InferConst: Clone + DebugWithInfcx<Self> + Hash + Ord;
+    type AliasConst: Clone + DebugWithInfcx<Self> + Hash + Ord;
+    type PlaceholderConst: Clone + Debug + Hash + Ord;
+    type ParamConst: Clone + Debug + Hash + Ord;
+    type BoundConst: Clone + Debug + Hash + Ord;
+    type ValueConst: Clone + Debug + Hash + Ord;
+    type ExprConst: Clone + DebugWithInfcx<Self> + Hash + Ord;
+
     type EarlyBoundRegion: Clone + Debug + Hash + Ord;
     type BoundRegion: Clone + Debug + Hash + Ord;
     type FreeRegion: Clone + Debug + Hash + Ord;
-    type RegionVid: Clone + Debug + Hash + Ord;
+    type RegionVid: Clone + DebugWithInfcx<Self> + Hash + Ord;
     type PlaceholderRegion: Clone + Debug + Hash + Ord;
+
+    fn ty_and_mut_to_parts(ty_and_mut: Self::TypeAndMut) -> (Self::Ty, Self::Mutability);
+    fn mutability_is_mut(mutbl: Self::Mutability) -> bool;
 }
 
 /// Imagine you have a function `F: FnOnce(&[T]) -> R`, plus an iterator `iter`
@@ -202,6 +215,11 @@ bitflags! {
         const HAS_RE_PLACEHOLDER          = 1 << 7;
         /// Does this have `ConstKind::Placeholder`?
         const HAS_CT_PLACEHOLDER          = 1 << 8;
+
+        /// Does this have placeholders?
+        const HAS_PLACEHOLDER           = TypeFlags::HAS_TY_PLACEHOLDER.bits
+                                          | TypeFlags::HAS_RE_PLACEHOLDER.bits
+                                          | TypeFlags::HAS_CT_PLACEHOLDER.bits;
 
         /// `true` if there are "names" of regions and so forth
         /// that are local to a particular fn/inferctxt
@@ -390,7 +408,19 @@ impl DebruijnIndex {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub fn debug_bound_var<T: std::fmt::Write>(
+    fmt: &mut T,
+    debruijn: DebruijnIndex,
+    var: impl std::fmt::Debug,
+) -> Result<(), std::fmt::Error> {
+    if debruijn == INNERMOST {
+        write!(fmt, "^{var:?}")
+    } else {
+        write!(fmt, "^{}_{:?}", debruijn.index(), var)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[derive(Encodable, Decodable, HashStable_Generic)]
 pub enum IntTy {
     Isize,
@@ -448,7 +478,7 @@ impl IntTy {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Copy, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Copy)]
 #[derive(Encodable, Decodable, HashStable_Generic)]
 pub enum UintTy {
     Usize,
@@ -506,7 +536,7 @@ impl UintTy {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[derive(Encodable, Decodable, HashStable_Generic)]
 pub enum FloatTy {
     F32,
@@ -544,16 +574,16 @@ rustc_index::newtype_index! {
     pub struct TyVid {}
 }
 
-/// An **int**egral (`u32`, `i32`, `usize`, etc.) type **v**ariable **ID**.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Encodable, Decodable)]
-pub struct IntVid {
-    pub index: u32,
+rustc_index::newtype_index! {
+    /// An **int**egral (`u32`, `i32`, `usize`, etc.) type **v**ariable **ID**.
+    #[debug_format = "?{}i"]
+    pub struct IntVid {}
 }
 
-/// An **float**ing-point (`f32` or `f64`) type **v**ariable **ID**.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Encodable, Decodable)]
-pub struct FloatVid {
-    pub index: u32,
+rustc_index::newtype_index! {
+    /// A **float**ing-point (`f32` or `f64`) type **v**ariable **ID**.
+    #[debug_format = "?{}f"]
+    pub struct FloatVid {}
 }
 
 /// A placeholder for a type that hasn't been inferred yet.
@@ -615,11 +645,11 @@ impl UnifyKey for IntVid {
     type Value = Option<IntVarValue>;
     #[inline] // make this function eligible for inlining - it is quite hot.
     fn index(&self) -> u32 {
-        self.index
+        self.as_u32()
     }
     #[inline]
     fn from_index(i: u32) -> IntVid {
-        IntVid { index: i }
+        IntVid::from_u32(i)
     }
     fn tag() -> &'static str {
         "IntVid"
@@ -632,11 +662,11 @@ impl UnifyKey for FloatVid {
     type Value = Option<FloatVarValue>;
     #[inline]
     fn index(&self) -> u32 {
-        self.index
+        self.as_u32()
     }
     #[inline]
     fn from_index(i: u32) -> FloatVid {
-        FloatVid { index: i }
+        FloatVid::from_u32(i)
     }
     fn tag() -> &'static str {
         "FloatVid"
@@ -737,32 +767,6 @@ impl fmt::Debug for IntVarValue {
 impl fmt::Debug for FloatVarValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
-    }
-}
-
-impl fmt::Debug for IntVid {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "?{}i", self.index)
-    }
-}
-
-impl fmt::Debug for FloatVid {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "?{}f", self.index)
-    }
-}
-
-impl fmt::Debug for InferTy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use InferTy::*;
-        match *self {
-            TyVar(ref v) => v.fmt(f),
-            IntVar(ref v) => v.fmt(f),
-            FloatVar(ref v) => v.fmt(f),
-            FreshTy(v) => write!(f, "FreshTy({v:?})"),
-            FreshIntTy(v) => write!(f, "FreshIntTy({v:?})"),
-            FreshFloatTy(v) => write!(f, "FreshFloatTy({v:?})"),
-        }
     }
 }
 

@@ -413,7 +413,7 @@ pub const unsafe fn size_of_val_raw<T: ?Sized>(val: *const T) -> usize {
 #[inline]
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(note = "use `align_of` instead", since = "1.2.0")]
+#[deprecated(note = "use `align_of` instead", since = "1.2.0", suggestion = "align_of")]
 pub fn min_align_of<T>() -> usize {
     intrinsics::min_align_of::<T>()
 }
@@ -436,7 +436,7 @@ pub fn min_align_of<T>() -> usize {
 #[inline]
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[deprecated(note = "use `align_of_val` instead", since = "1.2.0")]
+#[deprecated(note = "use `align_of_val` instead", since = "1.2.0", suggestion = "align_of_val")]
 pub fn min_align_of_val<T: ?Sized>(val: &T) -> usize {
     // SAFETY: val is a reference, so it's a valid raw pointer
     unsafe { intrinsics::min_align_of_val(val) }
@@ -968,7 +968,7 @@ pub const fn replace<T>(dest: &mut T, src: T) -> T {
 /// Integers and other types implementing [`Copy`] are unaffected by `drop`.
 ///
 /// ```
-/// # #![cfg_attr(not(bootstrap), allow(dropping_copy_types))]
+/// # #![allow(dropping_copy_types)]
 /// #[derive(Copy, Clone)]
 /// struct Foo(u8);
 ///
@@ -1125,6 +1125,11 @@ impl<T> fmt::Debug for Discriminant<T> {
 /// for more information.
 ///
 /// [Reference]: ../../reference/items/enumerations.html#custom-discriminant-values-for-fieldless-enumerations
+///
+/// The value of a [`Discriminant<T>`] is independent of any *lifetimes* in `T`. As such, reading
+/// or writing a `Discriminant<Foo<'a>>` as a `Discriminant<Foo<'b>>` (whether via [`transmute`] or
+/// otherwise) is always sound. Note that this is **not** true for other kinds of generic
+/// parameters; `Discriminant<Foo<A>>` and `Discriminant<Foo<B>>` might be incompatible.
 ///
 /// # Examples
 ///
@@ -1316,9 +1321,9 @@ impl<T> SizedTypeProperties for T {}
 ///
 /// assert_eq!(mem::offset_of!(NestedA, b.0), 0);
 /// ```
-#[cfg(not(bootstrap))]
 #[unstable(feature = "offset_of", issue = "106655")]
-#[allow_internal_unstable(builtin_syntax)]
+#[allow_internal_unstable(builtin_syntax, hint_must_use)]
 pub macro offset_of($Container:ty, $($fields:tt).+ $(,)?) {
-    builtin # offset_of($Container, $($fields).+)
+    // The `{}` is for better error messages
+    crate::hint::must_use({builtin # offset_of($Container, $($fields).+)})
 }

@@ -8,6 +8,7 @@ use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
 use log::trace;
+use either::Either;
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
@@ -259,8 +260,15 @@ impl VisitTags for Frame<'_, '_, Provenance, FrameExtra<'_>> {
         return_place.visit_tags(visit);
         // Locals.
         for local in locals.iter() {
-            if let LocalValue::Live(value) = &local.value {
-                value.visit_tags(visit);
+            match local.as_mplace_or_imm() {
+                None => {}
+                Some(Either::Left((ptr, meta))) => {
+                    ptr.visit_tags(visit);
+                    meta.visit_tags(visit);
+                }
+                Some(Either::Right(imm)) => {
+                    imm.visit_tags(visit);
+                }
             }
         }
 
@@ -834,7 +842,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         if let Some(thread_info_place) = thread {
             this.write_scalar(
                 Scalar::from_uint(new_thread_id.to_u32(), thread_info_place.layout.size),
-                &thread_info_place.into(),
+                &thread_info_place,
             )?;
         }
 

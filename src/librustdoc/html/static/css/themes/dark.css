@@ -26,6 +26,7 @@
 	--codeblock-error-color: rgba(255, 0, 0, .5);
 	--codeblock-ignore-hover-color: rgb(255, 142, 0);
 	--codeblock-ignore-color: rgba(255, 142, 0, .6);
+	--warning-border-color: #ff8e00;
 	--type-link-color: #2dbfb8;
 	--trait-link-color: #b78cf2;
 	--assoc-item-link-color: #d2991d;
@@ -84,14 +85,14 @@
 	--crate-search-div-hover-filter: invert(69%) sepia(60%) saturate(6613%) hue-rotate(184deg)
 		brightness(100%) contrast(91%);
 	--crate-search-hover-border: #2196f3;
-	--source-sidebar-background-selected: #333;
-	--source-sidebar-background-hover: #444;
-	--table-alt-row-background-color: #2A2A2A;
+	--src-sidebar-background-selected: #333;
+	--src-sidebar-background-hover: #444;
+	--table-alt-row-background-color: #2a2a2a;
 	--codeblock-link-background: #333;
 	--scrape-example-toggle-line-background: #999;
 	--scrape-example-toggle-line-hover-background: #c5c5c5;
-	--scrape-example-code-line-highlight: rgb(91, 59, 1);
-	--scrape-example-code-line-highlight-focus: rgb(124, 75, 15);
+	--scrape-example-code-line-highlight: #5b3b01;
+	--scrape-example-code-line-highlight-focus: #7c4b0f;
 	--scrape-example-help-border-color: #aaa;
 	--scrape-example-help-color: #eee;
 	--scrape-example-help-hover-border-color: #fff;

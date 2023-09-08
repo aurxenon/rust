@@ -14,6 +14,7 @@
 #![feature(staged_api)]
 #![feature(rustc_attrs)]
 #![feature(c_unwind)]
+#![allow(internal_features)]
 
 #[cfg(target_os = "android")]
 mod android;

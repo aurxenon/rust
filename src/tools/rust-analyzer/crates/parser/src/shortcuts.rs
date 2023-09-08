@@ -24,7 +24,7 @@ pub enum StrStep<'a> {
     Error { msg: &'a str, pos: usize },
 }
 
-impl<'a> LexedStr<'a> {
+impl LexedStr<'_> {
     pub fn to_input(&self) -> crate::Input {
         let mut res = crate::Input::default();
         let mut was_joint = false;
@@ -49,11 +49,13 @@ impl<'a> LexedStr<'a> {
                     if kind == SyntaxKind::FLOAT_NUMBER {
                         if !self.text(i).ends_with('.') {
                             res.was_joint();
+                        } else {
+                            was_joint = false;
                         }
+                    } else {
+                        was_joint = true;
                     }
                 }
-
-                was_joint = true;
             }
         }
         res
@@ -206,6 +208,7 @@ impl Builder<'_, '_> {
                     assert!(right.is_empty(), "{left}.{right}");
                     self.state = State::Normal;
                 } else {
+                    assert!(!right.is_empty(), "{left}.{right}");
                     (self.sink)(StrStep::Enter { kind: SyntaxKind::NAME_REF });
                     (self.sink)(StrStep::Token { kind: SyntaxKind::INT_NUMBER, text: right });
                     (self.sink)(StrStep::Exit);
@@ -225,7 +228,8 @@ fn n_attached_trivias<'a>(
 ) -> usize {
     match kind {
         CONST | ENUM | FN | IMPL | MACRO_CALL | MACRO_DEF | MACRO_RULES | MODULE | RECORD_FIELD
-        | STATIC | STRUCT | TRAIT | TUPLE_FIELD | TYPE_ALIAS | UNION | USE | VARIANT => {
+        | STATIC | STRUCT | TRAIT | TUPLE_FIELD | TYPE_ALIAS | UNION | USE | VARIANT
+        | EXTERN_CRATE => {
             let mut res = 0;
             let mut trivias = trivias.enumerate().peekable();
 

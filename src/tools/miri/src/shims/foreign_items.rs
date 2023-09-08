@@ -45,8 +45,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         // List taken from `library/std/src/sys/common/alloc.rs`.
         // This list should be kept in sync with the one from libstd.
         let min_align = match this.tcx.sess.target.arch.as_ref() {
-            "x86" | "arm" | "mips" | "powerpc" | "powerpc64" | "asmjs" | "wasm32" => 8,
-            "x86_64" | "aarch64" | "mips64" | "s390x" | "sparc64" | "loongarch64" => 16,
+            "x86" | "arm" | "mips" | "mips32r6" | "powerpc" | "powerpc64" | "asmjs" | "wasm32" => 8,
+            "x86_64" | "aarch64" | "mips64" | "mips64r6" | "s390x" | "sparc64" | "loongarch64" =>
+                16,
             arch => bug!("unsupported target architecture for malloc: `{}`", arch),
         };
         // Windows always aligns, even small allocations.
@@ -323,7 +324,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         // Second: functions that return immediately.
         match this.emulate_foreign_item_by_name(link_name, abi, args, dest)? {
             EmulateByNameResult::NeedsJumping => {
-                trace!("{:?}", this.dump_place(**dest));
+                trace!("{:?}", this.dump_place(dest));
                 this.go_to_block(ret);
             }
             EmulateByNameResult::AlreadyJumped => (),
@@ -409,14 +410,18 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         //     &mut self,
         //     arg1: &OpTy<'tcx, Provenance>,
         //     arg2: &OpTy<'tcx, Provenance>,
-        //     arg3: &OpTy<'tcx, Provenance>)
+        //     arg3: &OpTy<'tcx, Provenance>,
+        //     arg4: &OpTy<'tcx, Provenance>)
         // -> InterpResult<'tcx, Scalar<Provenance>> {
         //     let this = self.eval_context_mut();
         //
         //     // First thing: load all the arguments. Details depend on the shim.
         //     let arg1 = this.read_scalar(arg1)?.to_u32()?;
         //     let arg2 = this.read_pointer(arg2)?; // when you need to work with the pointer directly
-        //     let arg3 = this.deref_operand(arg3)?; // when you want to load/store through the pointer at its declared type
+        //     let arg3 = this.deref_pointer_as(arg3, this.libc_ty_layout("some_libc_struct"))?; // when you want to load/store
+        //         // through the pointer and supply the type information yourself
+        //     let arg4 = this.deref_pointer(arg4)?; // when you want to load/store through the pointer and trust
+        //         // the user-given type (which you shouldn't usually do)
         //
         //     // ...
         //
@@ -685,6 +690,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let right = this.read_pointer(right)?;
                 let n = Size::from_bytes(this.read_target_usize(n)?);
 
+                // C requires that this must always be a valid pointer (C18 §7.1.4).
+                this.ptr_get_alloc_id(left)?;
+                this.ptr_get_alloc_id(right)?;
+
                 let result = {
                     let left_bytes = this.read_bytes_ptr_strip_provenance(left, n)?;
                     let right_bytes = this.read_bytes_ptr_strip_provenance(right, n)?;
@@ -708,6 +717,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 // The docs say val is "interpreted as unsigned char".
                 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                 let val = val as u8;
+
+                // C requires that this must always be a valid pointer (C18 §7.1.4).
+                this.ptr_get_alloc_id(ptr)?;
 
                 if let Some(idx) = this
                     .read_bytes_ptr_strip_provenance(ptr, Size::from_bytes(num))?
@@ -733,6 +745,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                 let val = val as u8;
 
+                // C requires that this must always be a valid pointer (C18 §7.1.4).
+                this.ptr_get_alloc_id(ptr)?;
+
                 let idx = this
                     .read_bytes_ptr_strip_provenance(ptr, Size::from_bytes(num))?
                     .iter()
@@ -747,6 +762,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "strlen" => {
                 let [ptr] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let ptr = this.read_pointer(ptr)?;
+                // This reads at least 1 byte, so we are already enforcing that this is a valid pointer.
                 let n = this.read_c_str(ptr)?.len();
                 this.write_scalar(
                     Scalar::from_target_usize(u64::try_from(n).unwrap(), this),
@@ -759,6 +775,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let ptr_dest = this.read_pointer(ptr_dest)?;
                 let ptr_src = this.read_pointer(ptr_src)?;
                 let n = this.read_target_usize(n)?;
+
+                // C requires that this must always be a valid pointer, even if `n` is zero, so we better check that.
+                // (This is more than Rust requires, so `mem_copy` is not sufficient.)
+                this.ptr_get_alloc_id(ptr_dest)?;
+                this.ptr_get_alloc_id(ptr_src)?;
+
                 this.mem_copy(
                     ptr_src,
                     Align::ONE,
@@ -780,6 +802,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 // pointer provenance is preserved by this implementation of `strcpy`.
                 // That is probably overly cautious, but there also is no fundamental
                 // reason to have `strcpy` destroy pointer provenance.
+                // This reads at least 1 byte, so we are already enforcing that this is a valid pointer.
                 let n = this.read_c_str(ptr_src)?.len().checked_add(1).unwrap();
                 this.mem_copy(
                     ptr_src,
@@ -804,6 +827,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "atanf"
             | "log1pf"
             | "expm1f"
+            | "tgammaf"
             => {
                 let [f] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 // FIXME: Using host floats.
@@ -819,6 +843,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     "atanf" => f.atan(),
                     "log1pf" => f.ln_1p(),
                     "expm1f" => f.exp_m1(),
+                    "tgammaf" => f.gamma(),
                     _ => bug!(),
                 };
                 this.write_scalar(Scalar::from_u32(res.to_bits()), dest)?;
@@ -855,6 +880,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "atan"
             | "log1p"
             | "expm1"
+            | "tgamma"
             => {
                 let [f] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 // FIXME: Using host floats.
@@ -870,6 +896,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     "atan" => f.atan(),
                     "log1p" => f.ln_1p(),
                     "expm1" => f.exp_m1(),
+                    "tgamma" => f.gamma(),
                     _ => bug!(),
                 };
                 this.write_scalar(Scalar::from_u64(res.to_bits()), dest)?;
@@ -903,21 +930,57 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let x = this.read_scalar(x)?.to_f64()?;
                 let exp = this.read_scalar(exp)?.to_i32()?;
 
-                // Saturating cast to i16. Even those are outside the valid exponent range so
-                // `scalbn` below will do its over/underflow handling.
-                let exp = if exp > i32::from(i16::MAX) {
-                    i16::MAX
-                } else if exp < i32::from(i16::MIN) {
-                    i16::MIN
-                } else {
-                    exp.try_into().unwrap()
-                };
-
                 let res = x.scalbn(exp);
                 this.write_scalar(Scalar::from_f64(res), dest)?;
             }
+            "lgammaf_r" => {
+                let [x, signp] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                // FIXME: Using host floats.
+                let x = f32::from_bits(this.read_scalar(x)?.to_u32()?);
+                let signp = this.deref_pointer(signp)?;
 
-            // Architecture-specific shims
+                let (res, sign) = x.ln_gamma();
+                this.write_int(sign, &signp)?;
+                this.write_scalar(Scalar::from_u32(res.to_bits()), dest)?;
+            }
+            "lgamma_r" => {
+                let [x, signp] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                // FIXME: Using host floats.
+                let x = f64::from_bits(this.read_scalar(x)?.to_u64()?);
+                let signp = this.deref_pointer(signp)?;
+
+                let (res, sign) = x.ln_gamma();
+                this.write_int(sign, &signp)?;
+                this.write_scalar(Scalar::from_u64(res.to_bits()), dest)?;
+            }
+
+            // LLVM intrinsics
+            "llvm.prefetch" => {
+                let [p, rw, loc, ty] =
+                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+
+                let _ = this.read_pointer(p)?;
+                let rw = this.read_scalar(rw)?.to_i32()?;
+                let loc = this.read_scalar(loc)?.to_i32()?;
+                let ty = this.read_scalar(ty)?.to_i32()?;
+
+                if ty == 1 {
+                    // Data cache prefetch.
+                    // Notably, we do not have to check the pointer, this operation is never UB!
+
+                    if !matches!(rw, 0 | 1) {
+                        throw_unsup_format!("invalid `rw` value passed to `llvm.prefetch`: {}", rw);
+                    }
+                    if !matches!(loc, 0..=3) {
+                        throw_unsup_format!(
+                            "invalid `loc` value passed to `llvm.prefetch`: {}",
+                            loc
+                        );
+                    }
+                } else {
+                    throw_unsup_format!("unsupported `llvm.prefetch` type argument: {}", ty);
+                }
+            }
             "llvm.x86.addcarry.64" if this.tcx.sess.target.arch == "x86_64" => {
                 // Computes u8+u64+u64, returning tuple (u8,u64) comprising the output carry and truncated sum.
                 let [c_in, a, b] = this.check_shim(abi, Abi::Unadjusted, link_name, args)?;
@@ -931,9 +994,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 #[allow(clippy::arithmetic_side_effects)] // it's a u128, we can shift by 64
                 let (c_out, sum) = ((wide_sum >> 64).truncate::<u8>(), wide_sum.truncate::<u64>());
 
-                let c_out_field = this.place_field(dest, 0)?;
+                let c_out_field = this.project_field(dest, 0)?;
                 this.write_scalar(Scalar::from_u8(c_out), &c_out_field)?;
-                let sum_field = this.place_field(dest, 1)?;
+                let sum_field = this.project_field(dest, 1)?;
                 this.write_scalar(Scalar::from_u64(sum), &sum_field)?;
             }
             "llvm.x86.sse2.pause"
@@ -967,6 +1030,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                         throw_unsup_format!("unsupported llvm.arm.hint argument {}", arg);
                     }
                 }
+            }
+
+            name if name.starts_with("llvm.x86.sse.") => {
+                return shims::x86::sse::EvalContextExt::emulate_x86_sse_intrinsic(
+                    this, link_name, abi, args, dest,
+                );
             }
 
             // Platform-specific shims

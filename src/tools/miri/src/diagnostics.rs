@@ -1,8 +1,9 @@
-use std::fmt;
+use std::fmt::{self, Write};
 use std::num::NonZeroU64;
 
 use log::trace;
 
+use rustc_errors::DiagnosticMessage;
 use rustc_span::{source_map::DUMMY_SP, SpanData, Symbol};
 use rustc_target::abi::{Align, Size};
 
@@ -20,7 +21,7 @@ pub enum TerminationInfo {
     UnsupportedInIsolation(String),
     StackedBorrowsUb {
         msg: String,
-        help: Option<String>,
+        help: Vec<String>,
         history: Option<TagHistory>,
     },
     TreeBorrowsUb {
@@ -83,7 +84,25 @@ impl fmt::Display for TerminationInfo {
     }
 }
 
-impl MachineStopType for TerminationInfo {}
+impl fmt::Debug for TerminationInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+impl MachineStopType for TerminationInfo {
+    fn diagnostic_message(&self) -> DiagnosticMessage {
+        self.to_string().into()
+    }
+    fn add_args(
+        self: Box<Self>,
+        _: &mut dyn FnMut(
+            std::borrow::Cow<'static, str>,
+            rustc_errors::DiagnosticArgValue<'static>,
+        ),
+    ) {
+    }
+}
 
 /// Miri specific diagnostics
 pub enum NonHaltingDiagnostic {
@@ -204,11 +223,10 @@ pub fn report_error<'tcx, 'mir>(
                     (None, format!("or pass `-Zmiri-isolation-error=warn` to configure Miri to return an error code from isolated operations (if supported for that operation) and continue with a warning")),
                 ],
             StackedBorrowsUb { help, history, .. } => {
-                let url = "https://github.com/rust-lang/unsafe-code-guidelines/blob/master/wip/stacked-borrows.md";
                 msg.extend(help.clone());
                 let mut helps = vec![
                     (None, format!("this indicates a potential bug in the program: it performed an invalid operation, but the Stacked Borrows rules it violated are still experimental")),
-                    (None, format!("see {url} for further information")),
+                    (None, format!("see https://github.com/rust-lang/unsafe-code-guidelines/blob/master/wip/stacked-borrows.md for further information")),
                 ];
                 if let Some(TagHistory {created, invalidated, protected}) = history.clone() {
                     helps.push((Some(created.1), created.0));
@@ -252,25 +270,30 @@ pub fn report_error<'tcx, 'mir>(
         };
         (title, helps)
     } else {
-        #[rustfmt::skip]
         let title = match e.kind() {
-            UndefinedBehavior(_) =>
-                "Undefined Behavior",
-            ResourceExhaustion(_) =>
-                "resource exhaustion",
+            UndefinedBehavior(UndefinedBehaviorInfo::ValidationError(validation_err))
+                if matches!(
+                    validation_err.kind,
+                    ValidationErrorKind::PointerAsInt { .. } | ValidationErrorKind::PartialPointer
+                ) =>
+            {
+                ecx.handle_ice(); // print interpreter backtrace
+                bug!("This validation error should be impossible in Miri: {}", ecx.format_error(e));
+            }
+            UndefinedBehavior(_) => "Undefined Behavior",
+            ResourceExhaustion(_) => "resource exhaustion",
             Unsupported(
                 // We list only the ones that can actually happen.
-                UnsupportedOpInfo::Unsupported(_)
-            ) =>
-                "unsupported operation",
+                UnsupportedOpInfo::Unsupported(_) | UnsupportedOpInfo::UnsizedLocal,
+            ) => "unsupported operation",
             InvalidProgram(
                 // We list only the ones that can actually happen.
-                InvalidProgramInfo::AlreadyReported(_) |
-                InvalidProgramInfo::Layout(..)
-            ) =>
-                "post-monomorphization error",
-            kind =>
-                bug!("This error should be impossible in Miri: {kind:?}"),
+                InvalidProgramInfo::AlreadyReported(_) | InvalidProgramInfo::Layout(..),
+            ) => "post-monomorphization error",
+            _ => {
+                ecx.handle_ice(); // print interpreter backtrace
+                bug!("This error should be impossible in Miri: {}", ecx.format_error(e));
+            }
         };
         #[rustfmt::skip]
         let helps = match e.kind() {
@@ -283,11 +306,21 @@ pub fn report_error<'tcx, 'mir>(
                     (None, format!("this usually indicates that your program performed an invalid operation and caused Undefined Behavior")),
                     (None, format!("but due to `-Zmiri-symbolic-alignment-check`, alignment errors can also be false positives")),
                 ],
-            UndefinedBehavior(_) =>
-                vec![
+            UndefinedBehavior(info) => {
+                let mut helps = vec![
                     (None, format!("this indicates a bug in the program: it performed an invalid operation, and caused Undefined Behavior")),
                     (None, format!("see https://doc.rust-lang.org/nightly/reference/behavior-considered-undefined.html for further information")),
-                ],
+                ];
+                if let UndefinedBehaviorInfo::PointerUseAfterFree(alloc_id, _) | UndefinedBehaviorInfo::PointerOutOfBounds { alloc_id, .. } = info {
+                    if let Some(span) = ecx.machine.allocated_span(*alloc_id) {
+                        helps.push((Some(span), format!("{:?} was allocated here:", alloc_id)));
+                    }
+                    if let Some(span) = ecx.machine.deallocated_span(*alloc_id) {
+                        helps.push((Some(span), format!("{:?} was deallocated here:", alloc_id)));
+                    }
+                }
+                helps
+            }
             InvalidProgram(
                 InvalidProgramInfo::AlreadyReported(_)
             ) => {
@@ -302,11 +335,27 @@ pub fn report_error<'tcx, 'mir>(
 
     let stacktrace = ecx.generate_stacktrace();
     let (stacktrace, was_pruned) = prune_stacktrace(stacktrace, &ecx.machine);
-    e.print_backtrace();
-    msg.insert(0, e.to_string());
+
+    // We want to dump the allocation if this is `InvalidUninitBytes`. Since `format_error` consumes `e`, we compute the outut early.
+    let mut extra = String::new();
+    match e.kind() {
+        UndefinedBehavior(UndefinedBehaviorInfo::InvalidUninitBytes(Some((alloc_id, access)))) => {
+            writeln!(
+                extra,
+                "Uninitialized memory occurred at {alloc_id:?}{range:?}, in this allocation:",
+                range = access.bad,
+            )
+            .unwrap();
+            writeln!(extra, "{:?}", ecx.dump_alloc(*alloc_id)).unwrap();
+        }
+        _ => {}
+    }
+
+    msg.insert(0, ecx.format_error(e));
+
     report_msg(
         DiagLevel::Error,
-        &if let Some(title) = title { format!("{title}: {}", msg[0]) } else { msg[0].clone() },
+        if let Some(title) = title { format!("{title}: {}", msg[0]) } else { msg[0].clone() },
         msg,
         vec![],
         helps,
@@ -321,26 +370,16 @@ pub fn report_error<'tcx, 'mir>(
         );
     }
 
+    eprint!("{extra}"); // newlines are already in the string
+
     // Debug-dump all locals.
     for (i, frame) in ecx.active_thread_stack().iter().enumerate() {
         trace!("-------------------");
         trace!("Frame {}", i);
-        trace!("    return: {:?}", *frame.return_place);
+        trace!("    return: {:?}", frame.return_place);
         for (i, local) in frame.locals.iter().enumerate() {
-            trace!("    local {}: {:?}", i, local.value);
+            trace!("    local {}: {:?}", i, local);
         }
-    }
-
-    // Extra output to help debug specific issues.
-    match e.kind() {
-        UndefinedBehavior(UndefinedBehaviorInfo::InvalidUninitBytes(Some((alloc_id, access)))) => {
-            eprintln!(
-                "Uninitialized memory occurred at {alloc_id:?}{range:?}, in this allocation:",
-                range = access.uninit,
-            );
-            eprintln!("{:?}", ecx.dump_alloc(*alloc_id));
-        }
-        _ => {}
     }
 
     None
@@ -359,7 +398,7 @@ pub fn report_leaks<'mir, 'tcx>(
         any_pruned |= pruned;
         report_msg(
             DiagLevel::Error,
-            &format!(
+            format!(
                 "memory leaked: {id:?} ({}, size: {:?}, align: {:?}), allocated here:",
                 kind,
                 alloc.size().bytes(),
@@ -386,7 +425,7 @@ pub fn report_leaks<'mir, 'tcx>(
 /// additional `span_label` or `note` call.
 pub fn report_msg<'tcx>(
     diag_level: DiagLevel,
-    title: &str,
+    title: String,
     span_msg: Vec<String>,
     notes: Vec<(Option<SpanData>, String)>,
     helps: Vec<(Option<SpanData>, String)>,
@@ -438,12 +477,15 @@ pub fn report_msg<'tcx>(
         // Add visual separator before backtrace.
         err.note(if extra_span { "BACKTRACE (of the first span):" } else { "BACKTRACE:" });
     }
+
+    let (mut err, handler) = err.into_diagnostic().unwrap();
+
     // Add backtrace
     for (idx, frame_info) in stacktrace.iter().enumerate() {
         let is_local = machine.is_local(frame_info);
         // No span for non-local frames and the first frame (which is the error site).
         if is_local && idx > 0 {
-            err.span_note(frame_info.span, frame_info.to_string());
+            err.eager_subdiagnostic(handler, frame_info.as_note(machine.tcx));
         } else {
             let sm = sess.source_map();
             let span = sm.span_to_embeddable_string(frame_info.span);
@@ -451,7 +493,7 @@ pub fn report_msg<'tcx>(
         }
     }
 
-    err.emit();
+    handler.emit_diagnostic(&mut err);
 }
 
 impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
@@ -463,15 +505,16 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
         let (stacktrace, _was_pruned) = prune_stacktrace(stacktrace, self);
 
         let (title, diag_level) = match &e {
-            RejectedIsolatedOp(_) => ("operation rejected by isolation", DiagLevel::Warning),
-            Int2Ptr { .. } => ("integer-to-pointer cast", DiagLevel::Warning),
+            RejectedIsolatedOp(_) =>
+                ("operation rejected by isolation".to_string(), DiagLevel::Warning),
+            Int2Ptr { .. } => ("integer-to-pointer cast".to_string(), DiagLevel::Warning),
             CreatedPointerTag(..)
             | PoppedPointerTag(..)
             | CreatedCallId(..)
             | CreatedAlloc(..)
             | FreedAlloc(..)
             | ProgressReport { .. }
-            | WeakMemoryOutdatedLoad => ("tracking was triggered", DiagLevel::Note),
+            | WeakMemoryOutdatedLoad => ("tracking was triggered".to_string(), DiagLevel::Note),
         };
 
         let msg = match &e {
@@ -571,7 +614,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let stacktrace = this.generate_stacktrace();
         report_msg(
             DiagLevel::Note,
-            "the place in the program where the ICE was triggered",
+            "the place in the program where the ICE was triggered".to_string(),
             vec![],
             vec![],
             vec![],

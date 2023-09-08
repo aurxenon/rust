@@ -8,6 +8,7 @@ use std::fmt;
 
 use rustc_ast::ast;
 use rustc_hir::{def::CtorKind, def::DefKind, def_id::DefId};
+use rustc_metadata::rendered_const;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::symbol::sym;
 use rustc_span::{Pos, Symbol};
@@ -15,7 +16,6 @@ use rustc_target::spec::abi::Abi as RustcAbi;
 
 use rustdoc_json_types::*;
 
-use crate::clean::utils::print_const_expr;
 use crate::clean::{self, ItemId};
 use crate::formats::item_type::ItemType;
 use crate::json::JsonRenderer;
@@ -171,6 +171,7 @@ impl FromWithTcx<clean::GenericArg> for GenericArg {
 }
 
 impl FromWithTcx<clean::Constant> for Constant {
+    // FIXME(generic_const_items): Add support for generic const items.
     fn from_tcx(constant: clean::Constant, tcx: TyCtxt<'_>) -> Self {
         let expr = constant.expr(tcx);
         let value = constant.value(tcx);
@@ -310,7 +311,7 @@ fn from_clean_item(item: clean::Item, tcx: TyCtxt<'_>) -> ItemEnum {
         StaticItem(s) => ItemEnum::Static(s.into_tcx(tcx)),
         ForeignStaticItem(s) => ItemEnum::Static(s.into_tcx(tcx)),
         ForeignTypeItem => ItemEnum::ForeignType,
-        TypedefItem(t) => ItemEnum::Typedef(t.into_tcx(tcx)),
+        TypeAliasItem(t) => ItemEnum::TypeAlias(t.into_tcx(tcx)),
         OpaqueTyItem(t) => ItemEnum::OpaqueTy(t.into_tcx(tcx)),
         ConstantItem(c) => ItemEnum::Constant(c.into_tcx(tcx)),
         MacroItem(m) => ItemEnum::Macro(m.source),
@@ -321,8 +322,12 @@ fn from_clean_item(item: clean::Item, tcx: TyCtxt<'_>) -> ItemEnum {
                 impls: Vec::new(), // Added in JsonRenderer::item
             })
         }
-        TyAssocConstItem(ty) => ItemEnum::AssocConst { type_: ty.into_tcx(tcx), default: None },
-        AssocConstItem(ty, default) => {
+        // FIXME(generic_const_items): Add support for generic associated consts.
+        TyAssocConstItem(_generics, ty) => {
+            ItemEnum::AssocConst { type_: ty.into_tcx(tcx), default: None }
+        }
+        // FIXME(generic_const_items): Add support for generic associated consts.
+        AssocConstItem(_generics, ty, default) => {
             ItemEnum::AssocConst { type_: ty.into_tcx(tcx), default: Some(default.expr(tcx)) }
         }
         TyAssocTypeItem(g, b) => ItemEnum::AssocType {
@@ -624,10 +629,7 @@ impl FromWithTcx<clean::FnDecl> for FnDecl {
                 .into_iter()
                 .map(|arg| (arg.name.to_string(), arg.type_.into_tcx(tcx)))
                 .collect(),
-            output: match output {
-                clean::FnRetTy::Return(t) => Some(t.into_tcx(tcx)),
-                clean::FnRetTy::DefaultReturn => None,
-            },
+            output: if output.is_unit() { None } else { Some(output.into_tcx(tcx)) },
             c_variadic,
         }
     }
@@ -785,10 +787,10 @@ pub(crate) fn from_macro_kind(kind: rustc_span::hygiene::MacroKind) -> MacroKind
     }
 }
 
-impl FromWithTcx<Box<clean::Typedef>> for Typedef {
-    fn from_tcx(typedef: Box<clean::Typedef>, tcx: TyCtxt<'_>) -> Self {
-        let clean::Typedef { type_, generics, item_type: _ } = *typedef;
-        Typedef { type_: type_.into_tcx(tcx), generics: generics.into_tcx(tcx) }
+impl FromWithTcx<Box<clean::TypeAlias>> for TypeAlias {
+    fn from_tcx(type_alias: Box<clean::TypeAlias>, tcx: TyCtxt<'_>) -> Self {
+        let clean::TypeAlias { type_, generics, item_type: _, inner_type: _ } = *type_alias;
+        TypeAlias { type_: type_.into_tcx(tcx), generics: generics.into_tcx(tcx) }
     }
 }
 
@@ -803,7 +805,7 @@ impl FromWithTcx<clean::Static> for Static {
         Static {
             type_: stat.type_.into_tcx(tcx),
             mutable: stat.mutability == ast::Mutability::Mut,
-            expr: stat.expr.map(|e| print_const_expr(tcx, e)).unwrap_or_default(),
+            expr: stat.expr.map(|e| rendered_const(tcx, e)).unwrap_or_default(),
         }
     }
 }
@@ -825,7 +827,7 @@ impl FromWithTcx<ItemType> for ItemKind {
             Union => ItemKind::Union,
             Enum => ItemKind::Enum,
             Function | TyMethod | Method => ItemKind::Function,
-            Typedef => ItemKind::Typedef,
+            TypeAlias => ItemKind::TypeAlias,
             OpaqueTy => ItemKind::OpaqueTy,
             Static => ItemKind::Static,
             Constant => ItemKind::Constant,

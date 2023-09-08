@@ -5,6 +5,7 @@ use rustc_hir::{Expr, ExprKind, GenericArg};
 use rustc_lint::LateContext;
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::ty::{self, Ty};
+use rustc_span::sym;
 
 use super::CAST_PTR_ALIGNMENT;
 
@@ -66,7 +67,7 @@ fn is_used_as_unaligned(cx: &LateContext<'_>, e: &Expr<'_>) -> bool {
             if matches!(name.ident.as_str(), "read_unaligned" | "write_unaligned")
                 && let Some(def_id) = cx.typeck_results().type_dependent_def_id(parent.hir_id)
                 && let Some(def_id) = cx.tcx.impl_of_method(def_id)
-                && cx.tcx.type_of(def_id).subst_identity().is_unsafe_ptr()
+                && cx.tcx.type_of(def_id).instantiate_identity().is_unsafe_ptr()
             {
                 true
             } else {
@@ -76,13 +77,14 @@ fn is_used_as_unaligned(cx: &LateContext<'_>, e: &Expr<'_>) -> bool {
         ExprKind::Call(func, [arg, ..]) if arg.hir_id == e.hir_id => {
             static PATHS: &[&[&str]] = &[
                 paths::PTR_READ_UNALIGNED.as_slice(),
-                paths::PTR_WRITE_UNALIGNED.as_slice(),
                 paths::PTR_UNALIGNED_VOLATILE_LOAD.as_slice(),
                 paths::PTR_UNALIGNED_VOLATILE_STORE.as_slice(),
             ];
+
             if let ExprKind::Path(path) = &func.kind
                 && let Some(def_id) = cx.qpath_res(path, func.hir_id).opt_def_id()
-                && match_any_def_paths(cx, def_id, PATHS).is_some()
+                && (match_any_def_paths(cx, def_id, PATHS).is_some()
+                    || cx.tcx.is_diagnostic_item(sym::ptr_write_unaligned, def_id))
             {
                 true
             } else {

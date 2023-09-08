@@ -184,7 +184,7 @@ impl Socket {
             match unsafe { libc::poll(&mut pollfd, 1, timeout) } {
                 -1 => {
                     let err = io::Error::last_os_error();
-                    if err.kind() != io::ErrorKind::Interrupted {
+                    if !err.is_interrupted() {
                         return Err(err);
                     }
                 }
@@ -454,10 +454,16 @@ impl Socket {
         Ok(passcred != 0)
     }
 
-    #[cfg(not(any(target_os = "solaris", target_os = "illumos")))]
+    #[cfg(not(any(target_os = "solaris", target_os = "illumos", target_os = "vita")))]
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         let mut nonblocking = nonblocking as libc::c_int;
         cvt(unsafe { libc::ioctl(self.as_raw_fd(), libc::FIONBIO, &mut nonblocking) }).map(drop)
+    }
+
+    #[cfg(target_os = "vita")]
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        let option = nonblocking as libc::c_int;
+        setsockopt(self, libc::SOL_SOCKET, libc::SO_NONBLOCK, option)
     }
 
     #[cfg(any(target_os = "solaris", target_os = "illumos"))]

@@ -1,11 +1,16 @@
 //! checks for attributes
 
 use clippy_utils::diagnostics::{span_lint, span_lint_and_help, span_lint_and_sugg, span_lint_and_then};
+use clippy_utils::is_from_proc_macro;
 use clippy_utils::macros::{is_panic, macro_backtrace};
 use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::{first_line_of_span, is_present_in_source, snippet_opt, without_block_comments};
 use if_chain::if_chain;
-use rustc_ast::{AttrKind, AttrStyle, Attribute, LitKind, MetaItemKind, MetaItemLit, NestedMetaItem};
+use rustc_ast::token::{Token, TokenKind};
+use rustc_ast::tokenstream::TokenTree;
+use rustc_ast::{
+    AttrArgs, AttrArgsEq, AttrKind, AttrStyle, Attribute, LitKind, MetaItemKind, MetaItemLit, NestedMetaItem,
+};
 use rustc_errors::Applicability;
 use rustc_hir::{
     Block, Expr, ExprKind, ImplItem, ImplItemKind, Item, ItemKind, StmtKind, TraitFn, TraitItem, TraitItemKind,
@@ -340,6 +345,41 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
+    /// Checks for `#[should_panic]` attributes without specifying the expected panic message.
+    ///
+    /// ### Why is this bad?
+    /// The expected panic message should be specified to ensure that the test is actually
+    /// panicking with the expected message, and not another unrelated panic.
+    ///
+    /// ### Example
+    /// ```rust
+    /// fn random() -> i32 { 0 }
+    ///
+    /// #[should_panic]
+    /// #[test]
+    /// fn my_test() {
+    ///     let _ = 1 / random();
+    /// }
+    /// ```
+    ///
+    /// Use instead:
+    /// ```rust
+    /// fn random() -> i32 { 0 }
+    ///
+    /// #[should_panic = "attempt to divide by zero"]
+    /// #[test]
+    /// fn my_test() {
+    ///     let _ = 1 / random();
+    /// }
+    /// ```
+    #[clippy::version = "1.73.0"]
+    pub SHOULD_PANIC_WITHOUT_EXPECT,
+    pedantic,
+    "ensures that all `should_panic` attributes specify its expected panic message"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
     /// Checks for `any` and `all` combinators in `cfg` with only one condition.
     ///
     /// ### Why is this bad?
@@ -362,12 +402,39 @@ declare_clippy_lint! {
     "ensure that all `cfg(any())` and `cfg(all())` have more than one condition"
 }
 
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for `#[cfg(features = "...")]` and suggests to replace it with
+    /// `#[cfg(feature = "...")]`.
+    ///
+    /// ### Why is this bad?
+    /// Misspelling `feature` as `features` can be sometimes hard to spot. It
+    /// may cause conditional compilation not work quitely.
+    ///
+    /// ### Example
+    /// ```rust
+    /// #[cfg(features = "some-feature")]
+    /// fn conditional() { }
+    /// ```
+    ///
+    /// Use instead:
+    /// ```rust
+    /// #[cfg(feature = "some-feature")]
+    /// fn conditional() { }
+    /// ```
+    #[clippy::version = "1.69.0"]
+    pub MAYBE_MISUSED_CFG,
+    suspicious,
+    "prevent from misusing the wrong attr name"
+}
+
 declare_lint_pass!(Attributes => [
     ALLOW_ATTRIBUTES_WITHOUT_REASON,
     INLINE_ALWAYS,
     DEPRECATED_SEMVER,
     USELESS_ATTRIBUTE,
     BLANKET_CLIPPY_RESTRICTION_LINTS,
+    SHOULD_PANIC_WITHOUT_EXPECT,
 ]);
 
 impl<'tcx> LateLintPass<'tcx> for Attributes {
@@ -414,6 +481,9 @@ impl<'tcx> LateLintPass<'tcx> for Attributes {
                     }
                 }
             }
+        }
+        if attr.has_name(sym::should_panic) {
+            check_should_panic_reason(cx, attr);
         }
     }
 
@@ -523,6 +593,35 @@ fn extract_clippy_lint(lint: &NestedMetaItem) -> Option<Symbol> {
     None
 }
 
+fn check_should_panic_reason(cx: &LateContext<'_>, attr: &Attribute) {
+    if let AttrKind::Normal(normal_attr) = &attr.kind {
+        if let AttrArgs::Eq(_, AttrArgsEq::Hir(_)) = &normal_attr.item.args {
+            // `#[should_panic = ".."]` found, good
+            return;
+        }
+
+        if let AttrArgs::Delimited(args) = &normal_attr.item.args
+            && let mut tt_iter = args.tokens.trees()
+            && let Some(TokenTree::Token(Token { kind: TokenKind::Ident(sym::expected, _), .. }, _)) = tt_iter.next()
+            && let Some(TokenTree::Token(Token { kind: TokenKind::Eq, .. }, _)) = tt_iter.next()
+            && let Some(TokenTree::Token(Token { kind: TokenKind::Literal(_), .. }, _)) = tt_iter.next()
+        {
+            // `#[should_panic(expected = "..")]` found, good
+            return;
+        }
+
+        span_lint_and_sugg(
+            cx,
+            SHOULD_PANIC_WITHOUT_EXPECT,
+            attr.span,
+            "#[should_panic] attribute without a reason",
+            "consider specifying the expected panic",
+            r#"#[should_panic(expected = /* panic message */)]"#.into(),
+            Applicability::HasPlaceholders,
+        );
+    }
+}
+
 fn check_clippy_lint_names(cx: &LateContext<'_>, name: Symbol, items: &[NestedMetaItem]) {
     for lint in items {
         if let Some(lint_name) = extract_clippy_lint(lint) {
@@ -540,7 +639,7 @@ fn check_clippy_lint_names(cx: &LateContext<'_>, name: Symbol, items: &[NestedMe
     }
 }
 
-fn check_lint_reason(cx: &LateContext<'_>, name: Symbol, items: &[NestedMetaItem], attr: &'_ Attribute) {
+fn check_lint_reason<'cx>(cx: &LateContext<'cx>, name: Symbol, items: &[NestedMetaItem], attr: &'cx Attribute) {
     // Check for the feature
     if !cx.tcx.features().lint_reasons {
         return;
@@ -555,7 +654,7 @@ fn check_lint_reason(cx: &LateContext<'_>, name: Symbol, items: &[NestedMetaItem
     }
 
     // Check if the attribute is in an external macro and therefore out of the developer's control
-    if in_external_macro(cx.sess(), attr.span) {
+    if in_external_macro(cx.sess(), attr.span) || is_from_proc_macro(cx, &attr) {
         return;
     }
 
@@ -676,6 +775,7 @@ impl_lint_pass!(EarlyAttributes => [
     EMPTY_LINE_AFTER_OUTER_ATTR,
     EMPTY_LINE_AFTER_DOC_COMMENTS,
     NON_MINIMAL_CFG,
+    MAYBE_MISUSED_CFG,
 ]);
 
 impl EarlyLintPass for EarlyAttributes {
@@ -687,6 +787,7 @@ impl EarlyLintPass for EarlyAttributes {
         check_deprecated_cfg_attr(cx, attr, &self.msrv);
         check_mismatched_target_os(cx, attr);
         check_minimal_cfg_condition(cx, attr);
+        check_misused_cfg(cx, attr);
     }
 
     extract_msrv_attr!(EarlyContext);
@@ -777,7 +878,7 @@ fn check_deprecated_cfg_attr(cx: &EarlyContext<'_>, attr: &Attribute, msrv: &Msr
 }
 
 fn check_nested_cfg(cx: &EarlyContext<'_>, items: &[NestedMetaItem]) {
-    for item in items.iter() {
+    for item in items {
         if let NestedMetaItem::MetaItem(meta) = item {
             if !meta.has_name(sym::any) && !meta.has_name(sym::all) {
                 continue;
@@ -810,11 +911,40 @@ fn check_nested_cfg(cx: &EarlyContext<'_>, items: &[NestedMetaItem]) {
     }
 }
 
+fn check_nested_misused_cfg(cx: &EarlyContext<'_>, items: &[NestedMetaItem]) {
+    for item in items {
+        if let NestedMetaItem::MetaItem(meta) = item {
+            if meta.has_name(sym!(features)) && let Some(val) = meta.value_str() {
+                span_lint_and_sugg(
+                    cx,
+                    MAYBE_MISUSED_CFG,
+                    meta.span,
+                    "feature may misspelled as features",
+                    "use",
+                    format!("feature = \"{val}\""),
+                    Applicability::MaybeIncorrect,
+                );
+            }
+            if let MetaItemKind::List(list) = &meta.kind {
+                check_nested_misused_cfg(cx, list);
+            }
+        }
+    }
+}
+
 fn check_minimal_cfg_condition(cx: &EarlyContext<'_>, attr: &Attribute) {
     if attr.has_name(sym::cfg) &&
         let Some(items) = attr.meta_item_list()
     {
         check_nested_cfg(cx, &items);
+    }
+}
+
+fn check_misused_cfg(cx: &EarlyContext<'_>, attr: &Attribute) {
+    if attr.has_name(sym::cfg) &&
+        let Some(items) = attr.meta_item_list()
+    {
+        check_nested_misused_cfg(cx, &items);
     }
 }
 

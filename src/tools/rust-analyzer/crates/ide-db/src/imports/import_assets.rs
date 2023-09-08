@@ -6,14 +6,14 @@ use hir::{
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use syntax::{
-    ast::{self, HasName},
+    ast::{self, make, HasName},
     utils::path_to_string_stripping_turbo_fish,
     AstNode, SyntaxNode,
 };
 
 use crate::{
     helpers::item_name,
-    items_locator::{self, AssocItemSearch, DEFAULT_QUERY_SEARCH_LIMIT},
+    items_locator::{self, AssocSearchMode, DEFAULT_QUERY_SEARCH_LIMIT},
     RootDatabase,
 };
 
@@ -317,7 +317,7 @@ fn path_applicable_imports(
                 // * improve the associated completion item matching and/or scoring to ensure no noisy completions appear
                 //
                 // see also an ignored test under FIXME comment in the qualify_path.rs module
-                AssocItemSearch::Exclude,
+                AssocSearchMode::Exclude,
                 Some(DEFAULT_QUERY_SEARCH_LIMIT.inner()),
             )
             .filter_map(|item| {
@@ -334,7 +334,7 @@ fn path_applicable_imports(
                 sema,
                 current_crate,
                 path_candidate.name.clone(),
-                AssocItemSearch::Include,
+                AssocSearchMode::Include,
                 Some(DEFAULT_QUERY_SEARCH_LIMIT.inner()),
             )
             .filter_map(|item| {
@@ -362,12 +362,12 @@ fn import_for_item(
 
     let original_item_candidate = item_for_path_search(db, original_item)?;
     let import_path_candidate = mod_path(original_item_candidate)?;
-    let import_path_string = import_path_candidate.to_string();
+    let import_path_string = import_path_candidate.display(db).to_string();
 
     let expected_import_end = if item_as_assoc(db, original_item).is_some() {
         unresolved_qualifier.to_string()
     } else {
-        format!("{unresolved_qualifier}::{}", item_name(db, original_item)?)
+        format!("{unresolved_qualifier}::{}", item_name(db, original_item)?.display(db))
     };
     if !import_path_string.contains(unresolved_first_segment)
         || !import_path_string.ends_with(&expected_import_end)
@@ -483,7 +483,7 @@ fn trait_applicable_items(
         sema,
         current_crate,
         trait_candidate.assoc_item_name.clone(),
-        AssocItemSearch::AssocItemsOnly,
+        AssocSearchMode::AssocItemsOnly,
         Some(DEFAULT_QUERY_SEARCH_LIMIT.inner()),
     )
     .filter_map(|input| item_as_assoc(db, input))
@@ -607,7 +607,7 @@ impl ImportCandidate {
     fn for_name(sema: &Semantics<'_, RootDatabase>, name: &ast::Name) -> Option<Self> {
         if sema
             .scope(name.syntax())?
-            .speculative_resolve(&ast::make::ext::ident_path(&name.text()))
+            .speculative_resolve(&make::ext::ident_path(&name.text()))
             .is_some()
         {
             return None;

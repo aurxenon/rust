@@ -9,6 +9,8 @@ codegen_ssa_archive_build_failure =
 
 codegen_ssa_atomic_compare_exchange = Atomic compare-exchange intrinsic missing failure memory ordering
 
+codegen_ssa_binary_output_to_tty = option `-o` or `--emit` is used to write binary output type `{$shorthand}` to stdout, but stdout is a tty
+
 codegen_ssa_check_installed_visual_studio = please ensure that Visual Studio 2017 or later, or Build Tools for Visual Studio were installed with the Visual C++ option.
 
 codegen_ssa_copy_path = could not copy {$from} to {$to}: {$error}
@@ -18,6 +20,8 @@ codegen_ssa_copy_path_buf = unable to copy {$source_file} to {$output_path}: {$e
 codegen_ssa_create_temp_dir = couldn't create a temp dir: {$error}
 
 codegen_ssa_erroneous_constant = erroneous constant encountered
+
+codegen_ssa_error_creating_remark_dir = failed to create remark directory: {$error}
 
 codegen_ssa_expected_used_symbol = expected `used`, `used(compiler)` or `used(linker)`
 
@@ -30,6 +34,8 @@ codegen_ssa_extract_bundled_libs_open_file = failed to open file '{$rlib}': {$er
 codegen_ssa_extract_bundled_libs_parse_archive = failed to parse archive '{$rlib}': {$error}
 codegen_ssa_extract_bundled_libs_read_entry = failed to read entry '{$rlib}': {$error}
 codegen_ssa_extract_bundled_libs_write_file = failed to write file '{$rlib}': {$error}
+
+codegen_ssa_failed_to_get_layout = failed to get layout for {$ty}: {$err}
 
 codegen_ssa_failed_to_write = failed to write {$path}: {$error}
 
@@ -192,6 +198,8 @@ codegen_ssa_shuffle_indices_evaluation = could not evaluate shuffle_indices at c
 codegen_ssa_specify_libraries_to_link = use the `-l` flag to specify native libraries to link
 
 codegen_ssa_static_library_native_artifacts = Link against the following native artifacts when linking against this static library. The order and any duplication can be significant on some platforms.
+
+codegen_ssa_static_library_native_artifacts_to_file = Native artifacts to link against have been written to {$path}. The order and any duplication can be significant on some platforms.
 
 codegen_ssa_stripping_debug_info_failed = stripping debug info with `{$util}` failed: {$status}
     .note = {$output}

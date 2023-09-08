@@ -8,6 +8,9 @@ session_cannot_mix_and_match_sanitizers = `-Zsanitizer={$first}` is incompatible
 session_cgu_not_recorded =
     CGU-reuse for `{$cgu_user_name}` is (mangled: `{$cgu_name}`) was not recorded
 
+session_cli_feature_diagnostic_help =
+    add `-Zcrate-attr="feature({$feature})"` to the command-line options to enable
+
 session_crate_name_does_not_match = `--crate-name` and `#[crate_name]` are required to match, but `{$s}` != `{$name}`
 
 session_crate_name_empty = crate name must not be empty
@@ -26,7 +29,13 @@ session_feature_gate_error = {$explain}
 
 session_file_is_not_writeable = output file {$file} is not writeable -- check its permissions
 
+session_file_write_fail = failed to write `{$path}` due to error `{$err}`
+
 session_hexadecimal_float_literal_not_supported = hexadecimal float literal is not supported
+
+session_incompatible_linker_flavor = linker flavor `{$flavor}` is incompatible with the current target
+    .note = compatible flavors are: {$compatible_list}
+
 session_incorrect_cgu_reuse_type =
     CGU-reuse for `{$cgu_user_name}` is `{$actual_reuse}` but should be {$at_least ->
     [one] {"at least "}
@@ -39,6 +48,7 @@ session_int_literal_too_large = integer literal is too large
     .note = value exceeds limit of `{$limit}`
 
 session_invalid_character_in_create_name = invalid character `{$character}` in crate name: `{$crate_name}`
+session_invalid_character_in_create_name_help = you can either pass `--crate-name` on the command line or add `#![crate_name="…"]` to set the crate name
 
 session_invalid_float_literal_suffix = invalid suffix `{$suffix}` for float literal
     .label = invalid suffix `{$suffix}`
@@ -82,7 +92,9 @@ session_sanitizer_cfi_generalize_pointers_requires_cfi = `-Zsanitizer-cfi-genera
 
 session_sanitizer_cfi_normalize_integers_requires_cfi = `-Zsanitizer-cfi-normalize-integers` requires `-Zsanitizer=cfi` or `-Zsanitizer=kcfi`
 
-session_sanitizer_cfi_requires_lto = `-Zsanitizer=cfi` requires `-Clto`, `-Clto=thin`, or `-Clinker-plugin-lto`
+session_sanitizer_cfi_requires_lto = `-Zsanitizer=cfi` requires `-Clto` or `-Clinker-plugin-lto`
+
+session_sanitizer_cfi_requires_single_codegen_unit = `-Zsanitizer=cfi` with `-Clto` requires `-Ccodegen-units=1`
 
 session_sanitizer_not_supported = {$us} sanitizer is not supported for this target
 

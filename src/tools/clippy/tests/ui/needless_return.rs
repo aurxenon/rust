@@ -1,5 +1,3 @@
-//@run-rustfix
-
 #![feature(lint_reasons)]
 #![feature(yeet_expr)]
 #![allow(unused)]
@@ -7,7 +5,8 @@
     clippy::if_same_then_else,
     clippy::single_match,
     clippy::needless_bool,
-    clippy::equatable_if_let
+    clippy::equatable_if_let,
+    clippy::needless_else
 )]
 #![warn(clippy::needless_return)]
 

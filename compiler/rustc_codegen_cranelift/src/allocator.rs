@@ -39,8 +39,8 @@ fn codegen_inner(
     if kind == AllocatorKind::Default {
         for method in ALLOCATOR_METHODS {
             let mut arg_tys = Vec::with_capacity(method.inputs.len());
-            for ty in method.inputs.iter() {
-                match *ty {
+            for input in method.inputs.iter() {
+                match input.ty {
                     AllocatorTy::Layout => {
                         arg_tys.push(usize_ty); // size
                         arg_tys.push(usize_ty); // align
@@ -89,16 +89,16 @@ fn codegen_inner(
     );
 
     let data_id = module.declare_data(OomStrategy::SYMBOL, Linkage::Export, false, false).unwrap();
-    let mut data_ctx = DataContext::new();
-    data_ctx.set_align(1);
+    let mut data = DataDescription::new();
+    data.set_align(1);
     let val = oom_strategy.should_panic();
-    data_ctx.define(Box::new([val]));
-    module.define_data(data_id, &data_ctx).unwrap();
+    data.define(Box::new([val]));
+    module.define_data(data_id, &data).unwrap();
 
     let data_id =
         module.declare_data(NO_ALLOC_SHIM_IS_UNSTABLE, Linkage::Export, false, false).unwrap();
-    let mut data_ctx = DataContext::new();
-    data_ctx.set_align(1);
-    data_ctx.define(Box::new([0]));
-    module.define_data(data_id, &data_ctx).unwrap();
+    let mut data = DataDescription::new();
+    data.set_align(1);
+    data.define(Box::new([0]));
+    module.define_data(data_id, &data).unwrap();
 }

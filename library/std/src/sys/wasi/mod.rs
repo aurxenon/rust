@@ -29,8 +29,7 @@ pub mod fs;
 #[path = "../wasm/atomics/futex.rs"]
 pub mod futex;
 pub mod io;
-#[path = "../unsupported/locks/mod.rs"]
-pub mod locks;
+
 pub mod net;
 pub mod os;
 #[path = "../unix/os_str.rs"]
@@ -47,14 +46,27 @@ pub mod thread;
 pub mod thread_local_dtor;
 #[path = "../unsupported/thread_local_key.rs"]
 pub mod thread_local_key;
-#[path = "../unsupported/thread_parking.rs"]
-pub mod thread_parking;
 pub mod time;
 
 cfg_if::cfg_if! {
-    if #[cfg(not(target_feature = "atomics"))] {
+    if #[cfg(target_feature = "atomics")] {
+        #[path = "../unix/locks"]
+        pub mod locks {
+            #![allow(unsafe_op_in_unsafe_fn)]
+            mod futex_condvar;
+            mod futex_mutex;
+            mod futex_rwlock;
+            pub(crate) use futex_condvar::Condvar;
+            pub(crate) use futex_mutex::Mutex;
+            pub(crate) use futex_rwlock::RwLock;
+        }
+    } else {
+        #[path = "../unsupported/locks/mod.rs"]
+        pub mod locks;
         #[path = "../unsupported/once.rs"]
         pub mod once;
+        #[path = "../unsupported/thread_parking.rs"]
+        pub mod thread_parking;
     }
 }
 
@@ -63,6 +75,11 @@ cfg_if::cfg_if! {
 #[allow(unused)]
 mod common;
 pub use common::*;
+
+#[inline]
+pub fn is_interrupted(errno: i32) -> bool {
+    errno == wasi::ERRNO_INTR.raw().into()
+}
 
 pub fn decode_error_kind(errno: i32) -> std_io::ErrorKind {
     use std_io::ErrorKind::*;

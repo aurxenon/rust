@@ -86,6 +86,9 @@ pub(crate) struct Cache {
     /// Whether to document private items.
     /// This is stored in `Cache` so it doesn't need to be passed through all rustdoc functions.
     pub(crate) document_private: bool,
+    /// Whether to document hidden items.
+    /// This is stored in `Cache` so it doesn't need to be passed through all rustdoc functions.
+    pub(crate) document_hidden: bool,
 
     /// Crates marked with [`#[doc(masked)]`][doc_masked].
     ///
@@ -121,6 +124,11 @@ pub(crate) struct Cache {
     pub(crate) intra_doc_links: FxHashMap<ItemId, FxIndexSet<clean::ItemLink>>,
     /// Cfg that have been hidden via #![doc(cfg_hide(...))]
     pub(crate) hidden_cfg: FxHashSet<clean::cfg::Cfg>,
+
+    /// Contains the list of `DefId`s which have been inlined. It is used when generating files
+    /// to check if a stripped item should get its file generated or not: if it's inside a
+    /// `#[doc(hidden)]` item or a private one and not inlined, it shouldn't get a file.
+    pub(crate) inlined_items: DefIdSet,
 }
 
 /// This struct is used to wrap the `cache` and `tcx` in order to run `DocFolder`.
@@ -132,8 +140,8 @@ struct CacheBuilder<'a, 'tcx> {
 }
 
 impl Cache {
-    pub(crate) fn new(document_private: bool) -> Self {
-        Cache { document_private, ..Cache::default() }
+    pub(crate) fn new(document_private: bool, document_hidden: bool) -> Self {
+        Cache { document_private, document_hidden, ..Cache::default() }
     }
 
     /// Populates the `Cache` with more data. The returned `Crate` will be missing some data that was
@@ -147,7 +155,7 @@ impl Cache {
 
         // Cache where all our extern crates are located
         // FIXME: this part is specific to HTML so it'd be nice to remove it from the common code
-        for &crate_num in cx.tcx.crates(()) {
+        for &crate_num in tcx.crates(()) {
             let e = ExternalCrate { crate_num };
 
             let name = e.name(tcx);
@@ -381,7 +389,7 @@ impl<'a, 'tcx> DocFolder for CacheBuilder<'a, 'tcx> {
         match *item.kind {
             clean::StructItem(..)
             | clean::EnumItem(..)
-            | clean::TypedefItem(..)
+            | clean::TypeAliasItem(..)
             | clean::TraitItem(..)
             | clean::TraitAliasItem(..)
             | clean::FunctionItem(..)
@@ -449,6 +457,7 @@ impl<'a, 'tcx> DocFolder for CacheBuilder<'a, 'tcx> {
             | clean::StructItem(..)
             | clean::UnionItem(..)
             | clean::VariantItem(..)
+            | clean::TypeAliasItem(..)
             | clean::ImplItem(..) => {
                 self.cache.parent_stack.push(ParentStackItem::new(&item));
                 (self.fold_item_recur(item), true)
@@ -468,7 +477,7 @@ impl<'a, 'tcx> DocFolder for CacheBuilder<'a, 'tcx> {
                 | clean::BorrowedRef { type_: box clean::Type::Path { ref path }, .. } => {
                     dids.insert(path.def_id());
                     if let Some(generics) = path.generics() &&
-                        let ty::Adt(adt, _) = self.tcx.type_of(path.def_id()).subst_identity().kind() &&
+                        let ty::Adt(adt, _) = self.tcx.type_of(path.def_id()).instantiate_identity().kind() &&
                         adt.is_fundamental() {
                         for ty in generics {
                             if let Some(did) = ty.def_id(self.cache) {

@@ -1,3 +1,4 @@
+use build_helper::util::try_run;
 use compiletest::header::TestProps;
 use config::Config;
 use std::path::{Path, PathBuf};
@@ -13,13 +14,19 @@ fn get_browser_ui_test_version_inner(npm: &Path, global: bool) -> Option<String>
     if global {
         command.arg("--global");
     }
-    let lines = command
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or(String::new());
+    let lines = match command.output() {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Err(e) => {
+            eprintln!(
+                "path to npm can be wrong, provided path: {npm:?}. Try to set npm path \
+            in config.toml in [build.npm]",
+            );
+            panic!("{:?}", e)
+        }
+    };
     lines
         .lines()
-        .find_map(|l| l.split(':').nth(1)?.strip_prefix("browser-ui-test@"))
+        .find_map(|l| l.rsplit(':').next()?.strip_prefix("browser-ui-test@"))
         .map(|v| v.to_owned())
 }
 
@@ -60,24 +67,7 @@ fn find_librs<P: AsRef<Path>>(path: P) -> Option<PathBuf> {
     None
 }
 
-// FIXME: move `bootstrap::util::try_run` into `build_helper` crate
-// and use that one instead of creating this function.
-fn try_run(cmd: &mut Command, print_cmd_on_fail: bool) -> bool {
-    let status = match cmd.status() {
-        Ok(status) => status,
-        Err(e) => panic!("failed to execute command: {:?}\nerror: {}", cmd, e),
-    };
-    if !status.success() && print_cmd_on_fail {
-        println!(
-            "\n\ncommand did not execute successfully: {:?}\n\
-             expected success, got: {}\n\n",
-            cmd, status
-        );
-    }
-    status.success()
-}
-
-fn main() {
+fn main() -> Result<(), ()> {
     let config = Arc::new(Config::from_args(env::args().collect()));
 
     // The goal here is to check if the necessary packages are installed, and if not, we
@@ -138,11 +128,24 @@ If you want to install the `browser-ui-test` dependency, run `npm install browse
                 }
             }
 
-            try_run(&mut cargo, config.verbose);
+            if try_run(&mut cargo, config.verbose).is_err() {
+                eprintln!("failed to document `{}`", entry.path().display());
+                panic!("Cannot run rustdoc-gui tests");
+            }
         }
     }
 
     let mut command = Command::new(&config.nodejs);
+
+    if let Ok(current_dir) = env::current_dir() {
+        let local_node_modules = current_dir.join("node_modules");
+        if local_node_modules.exists() {
+            // Link the local node_modules if exists.
+            // This is useful when we run rustdoc-gui-test from outside of the source root.
+            env::set_var("NODE_PATH", local_node_modules);
+        }
+    }
+
     command
         .arg(config.rust_src.join("src/tools/rustdoc-gui/tester.js"))
         .arg("--jobs")
@@ -158,5 +161,5 @@ If you want to install the `browser-ui-test` dependency, run `npm install browse
 
     command.args(&config.test_args);
 
-    try_run(&mut command, config.verbose);
+    try_run(&mut command, config.verbose)
 }

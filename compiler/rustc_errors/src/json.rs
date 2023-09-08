@@ -10,6 +10,7 @@
 // FIXME: spec the JSON output properly.
 
 use rustc_span::source_map::{FilePathMapping, SourceMap};
+use termcolor::{ColorSpec, WriteColor};
 
 use crate::emitter::{Emitter, HumanReadableErrorType};
 use crate::registry::Registry;
@@ -21,7 +22,7 @@ use crate::{
 };
 use rustc_lint_defs::Applicability;
 
-use rustc_data_structures::sync::Lrc;
+use rustc_data_structures::sync::{IntoDynSyncSend, Lrc};
 use rustc_error_messages::FluentArgs;
 use rustc_span::hygiene::ExpnData;
 use rustc_span::Span;
@@ -37,7 +38,7 @@ use serde::Serialize;
 mod tests;
 
 pub struct JsonEmitter {
-    dst: Box<dyn Write + Send>,
+    dst: IntoDynSyncSend<Box<dyn Write + Send>>,
     registry: Option<Registry>,
     sm: Lrc<SourceMap>,
     fluent_bundle: Option<Lrc<FluentBundle>>,
@@ -65,7 +66,7 @@ impl JsonEmitter {
         terminal_url: TerminalUrl,
     ) -> JsonEmitter {
         JsonEmitter {
-            dst: Box::new(io::BufWriter::new(io::stderr())),
+            dst: IntoDynSyncSend(Box::new(io::BufWriter::new(io::stderr()))),
             registry,
             sm: source_map,
             fluent_bundle,
@@ -119,7 +120,7 @@ impl JsonEmitter {
         terminal_url: TerminalUrl,
     ) -> JsonEmitter {
         JsonEmitter {
-            dst,
+            dst: IntoDynSyncSend(dst),
             registry,
             sm: source_map,
             fluent_bundle,
@@ -159,7 +160,7 @@ impl Emitter for JsonEmitter {
         }
         .and_then(|_| self.dst.flush());
         if let Err(e) = result {
-            panic!("failed to print diagnostics: {:?}", e);
+            panic!("failed to print diagnostics: {e:?}");
         }
     }
 
@@ -172,7 +173,7 @@ impl Emitter for JsonEmitter {
         }
         .and_then(|_| self.dst.flush());
         if let Err(e) = result {
-            panic!("failed to print notification: {:?}", e);
+            panic!("failed to print notification: {e:?}");
         }
     }
 
@@ -194,7 +195,7 @@ impl Emitter for JsonEmitter {
         }
         .and_then(|_| self.dst.flush());
         if let Err(e) = result {
-            panic!("failed to print future breakage report: {:?}", e);
+            panic!("failed to print future breakage report: {e:?}");
         }
     }
 
@@ -208,7 +209,7 @@ impl Emitter for JsonEmitter {
         }
         .and_then(|_| self.dst.flush());
         if let Err(e) = result {
-            panic!("failed to print unused externs: {:?}", e);
+            panic!("failed to print unused externs: {e:?}");
         }
     }
 
@@ -356,20 +357,29 @@ impl Diagnostic {
                 self.0.lock().unwrap().flush()
             }
         }
+        impl WriteColor for BufWriter {
+            fn supports_color(&self) -> bool {
+                false
+            }
+
+            fn set_color(&mut self, _spec: &ColorSpec) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn reset(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
         let buf = BufWriter::default();
         let output = buf.clone();
         je.json_rendered
-            .new_emitter(
-                Box::new(buf),
-                Some(je.sm.clone()),
-                je.fluent_bundle.clone(),
-                je.fallback_bundle.clone(),
-                false,
-                je.diagnostic_width,
-                je.macro_backtrace,
-                je.track_diagnostics,
-                je.terminal_url,
-            )
+            .new_emitter(Box::new(buf), je.fallback_bundle.clone())
+            .sm(Some(je.sm.clone()))
+            .fluent_bundle(je.fluent_bundle.clone())
+            .diagnostic_width(je.diagnostic_width)
+            .macro_backtrace(je.macro_backtrace)
+            .track_diagnostics(je.track_diagnostics)
+            .terminal_url(je.terminal_url)
             .ui_testing(je.ui_testing)
             .emit_diagnostic(diag);
         let output = Arc::try_unwrap(output.0).unwrap().into_inner().unwrap();
@@ -548,7 +558,7 @@ impl DiagnosticSpanLine {
             .span_to_lines(span)
             .map(|lines| {
                 // We can't get any lines if the source is unavailable.
-                if !je.sm.ensure_source_file_source_present(lines.file.clone()) {
+                if !je.sm.ensure_source_file_source_present(&lines.file) {
                     return vec![];
                 }
 

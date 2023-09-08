@@ -60,7 +60,7 @@ use crate::mir::mono::MonoItem;
 use crate::ty::TyCtxt;
 
 use rustc_data_structures::fingerprint::Fingerprint;
-use rustc_hir::def_id::{CrateNum, DefId, LocalDefId};
+use rustc_hir::def_id::{CrateNum, DefId, LocalDefId, LocalModDefId, ModDefId, LOCAL_CRATE};
 use rustc_hir::definitions::DefPathHash;
 use rustc_hir::{HirId, ItemLocalId, OwnerId};
 use rustc_query_system::dep_graph::FingerprintStyle;
@@ -80,10 +80,54 @@ macro_rules! define_dep_nodes {
         }
 
         /// This enum serves as an index into arrays built by `make_dep_kind_array`.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encodable, Decodable)]
+        // This enum has more than u8::MAX variants so we need some kind of multi-byte
+        // encoding. The derived Encodable/Decodable uses leb128 encoding which is
+        // dense when only considering this enum. But DepKind is encoded in a larger
+        // struct, and there we can take advantage of the unused bits in the u16.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         #[allow(non_camel_case_types)]
+        #[repr(u16)]
         pub enum DepKind {
             $( $( #[$attr] )* $variant),*
+        }
+
+        impl DepKind {
+            // This const implements two things: A bounds check so that we can decode
+            // a DepKind from a u16 with just one check, and a const check that the
+            // discriminants of the variants have been assigned consecutively from 0
+            // so that just the one comparison suffices to check that the u16 can be
+            // transmuted to a DepKind.
+            pub const VARIANTS: u16 = {
+                let deps: &[DepKind] = &[$(DepKind::$variant,)*];
+                let mut i = 0;
+                while i < deps.len() {
+                    if i as u16 != deps[i] as u16 {
+                        panic!();
+                    }
+                    i += 1;
+                }
+                deps.len() as u16
+            };
+        }
+
+        impl<S: rustc_serialize::Encoder> rustc_serialize::Encodable<S> for DepKind {
+            #[inline]
+            fn encode(&self, s: &mut S) {
+                s.emit_u16(*self as u16);
+            }
+        }
+
+        impl<D: rustc_serialize::Decoder> rustc_serialize::Decodable<D> for DepKind {
+            #[inline]
+            fn decode(d: &mut D) -> DepKind {
+                let discrim = d.read_u16();
+                assert!(discrim < DepKind::VARIANTS);
+                // SAFETY: DepKind::VARIANTS checks that the discriminant values permit
+                // this one check to soundly guard the transmute.
+                unsafe {
+                    std::mem::transmute::<u16, DepKind>(discrim)
+                }
+            }
         }
 
         pub(super) fn dep_kind_from_label_string(label: &str) -> Result<DepKind, ()> {
@@ -113,6 +157,8 @@ rustc_query_append!(define_dep_nodes![
     [] fn CompileCodegenUnit() -> (),
     [] fn CompileMonoItem() -> (),
 ]);
+
+static_assert_size!(DepKind, 2);
 
 // WARNING: `construct` is generic and does not know that `CompileCodegenUnit` takes `Symbol`s as keys.
 // Be very careful changing this type signature!
@@ -371,7 +417,7 @@ impl<'tcx> DepNodeParams<TyCtxt<'tcx>> for HirId {
     fn recover(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
         if tcx.fingerprint_style(dep_node.kind) == FingerprintStyle::HirId {
             let (local_hash, local_id) = Fingerprint::from(dep_node.hash).split();
-            let def_path_hash = DefPathHash::new(tcx.sess.local_stable_crate_id(), local_hash);
+            let def_path_hash = DefPathHash::new(tcx.stable_crate_id(LOCAL_CRATE), local_hash);
             let def_id = tcx
                 .def_path_hash_to_def_id(def_path_hash, &mut || {
                     panic!("Failed to extract HirId: {:?} {}", dep_node.kind, dep_node.hash)
@@ -380,10 +426,60 @@ impl<'tcx> DepNodeParams<TyCtxt<'tcx>> for HirId {
             let local_id = local_id
                 .as_u64()
                 .try_into()
-                .unwrap_or_else(|_| panic!("local id should be u32, found {:?}", local_id));
+                .unwrap_or_else(|_| panic!("local id should be u32, found {local_id:?}"));
             Some(HirId { owner: OwnerId { def_id }, local_id: ItemLocalId::from_u32(local_id) })
         } else {
             None
         }
     }
 }
+
+macro_rules! impl_for_typed_def_id {
+    ($Name:ident, $LocalName:ident) => {
+        impl<'tcx> DepNodeParams<TyCtxt<'tcx>> for $Name {
+            #[inline(always)]
+            fn fingerprint_style() -> FingerprintStyle {
+                FingerprintStyle::DefPathHash
+            }
+
+            #[inline(always)]
+            fn to_fingerprint(&self, tcx: TyCtxt<'tcx>) -> Fingerprint {
+                self.to_def_id().to_fingerprint(tcx)
+            }
+
+            #[inline(always)]
+            fn to_debug_str(&self, tcx: TyCtxt<'tcx>) -> String {
+                self.to_def_id().to_debug_str(tcx)
+            }
+
+            #[inline(always)]
+            fn recover(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
+                DefId::recover(tcx, dep_node).map($Name::new_unchecked)
+            }
+        }
+
+        impl<'tcx> DepNodeParams<TyCtxt<'tcx>> for $LocalName {
+            #[inline(always)]
+            fn fingerprint_style() -> FingerprintStyle {
+                FingerprintStyle::DefPathHash
+            }
+
+            #[inline(always)]
+            fn to_fingerprint(&self, tcx: TyCtxt<'tcx>) -> Fingerprint {
+                self.to_def_id().to_fingerprint(tcx)
+            }
+
+            #[inline(always)]
+            fn to_debug_str(&self, tcx: TyCtxt<'tcx>) -> String {
+                self.to_def_id().to_debug_str(tcx)
+            }
+
+            #[inline(always)]
+            fn recover(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
+                LocalDefId::recover(tcx, dep_node).map($LocalName::new_unchecked)
+            }
+        }
+    };
+}
+
+impl_for_typed_def_id! { ModDefId, LocalModDefId }

@@ -4,19 +4,37 @@ error: `find(..).map(..)` can be simplified as `find_map(..)`
 LL |     let _ = (0..).find(|n| to_opt(*n).is_some()).map(|a| to_opt(a).unwrap());
    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `find_map(|a| to_opt(a))`
    |
+note: the suggestion might change the behavior of the program when merging `filter` and `map`, because this expression potentially contains side effects and will only execute once
+  --> $DIR/manual_find_map.rs:8:28
+   |
+LL |     let _ = (0..).find(|n| to_opt(*n).is_some()).map(|a| to_opt(a).unwrap());
+   |                            ^^^^^^^^^^
    = note: `-D clippy::manual-find-map` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::manual_find_map)]`
 
 error: `find(..).map(..)` can be simplified as `find_map(..)`
   --> $DIR/manual_find_map.rs:11:19
    |
 LL |     let _ = (0..).find(|&n| to_opt(n).is_some()).map(|a| to_opt(a).expect("hi"));
    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `find_map(|a| to_opt(a))`
+   |
+note: the suggestion might change the behavior of the program when merging `filter` and `map`, because this expression potentially contains side effects and will only execute once
+  --> $DIR/manual_find_map.rs:11:29
+   |
+LL |     let _ = (0..).find(|&n| to_opt(n).is_some()).map(|a| to_opt(a).expect("hi"));
+   |                             ^^^^^^^^^
 
 error: `find(..).map(..)` can be simplified as `find_map(..)`
   --> $DIR/manual_find_map.rs:14:19
    |
 LL |     let _ = (0..).find(|&n| to_res(n).is_ok()).map(|a| to_res(a).unwrap_or(1));
    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `find_map(|a| to_res(a).ok())`
+   |
+note: the suggestion might change the behavior of the program when merging `filter` and `map`, because this expression potentially contains side effects and will only execute once
+  --> $DIR/manual_find_map.rs:14:29
+   |
+LL |     let _ = (0..).find(|&n| to_res(n).is_ok()).map(|a| to_res(a).unwrap_or(1));
+   |                             ^^^^^^^^^
 
 error: `find(..).map(..)` can be simplified as `find_map(..)`
   --> $DIR/manual_find_map.rs:17:10
@@ -25,6 +43,12 @@ LL |           .find(|&x| to_ref(to_opt(x)).is_some())
    |  __________^
 LL | |         .map(|y| to_ref(to_opt(y)).unwrap());
    | |____________________________________________^ help: try: `find_map(|y| *to_ref(to_opt(y)))`
+   |
+note: the suggestion might change the behavior of the program when merging `filter` and `map`, because this expression potentially contains side effects and will only execute once
+  --> $DIR/manual_find_map.rs:17:20
+   |
+LL |         .find(|&x| to_ref(to_opt(x)).is_some())
+   |                    ^^^^^^^^^^^^^^^^^
 
 error: `find(..).map(..)` can be simplified as `find_map(..)`
   --> $DIR/manual_find_map.rs:20:10
@@ -33,6 +57,12 @@ LL |           .find(|x| to_ref(to_opt(*x)).is_some())
    |  __________^
 LL | |         .map(|y| to_ref(to_opt(y)).unwrap());
    | |____________________________________________^ help: try: `find_map(|y| *to_ref(to_opt(y)))`
+   |
+note: the suggestion might change the behavior of the program when merging `filter` and `map`, because this expression potentially contains side effects and will only execute once
+  --> $DIR/manual_find_map.rs:20:19
+   |
+LL |         .find(|x| to_ref(to_opt(*x)).is_some())
+   |                   ^^^^^^^^^^^^^^^^^^
 
 error: `find(..).map(..)` can be simplified as `find_map(..)`
   --> $DIR/manual_find_map.rs:24:10
@@ -41,6 +71,12 @@ LL |           .find(|&x| to_ref(to_res(x)).is_ok())
    |  __________^
 LL | |         .map(|y| to_ref(to_res(y)).unwrap());
    | |____________________________________________^ help: try: `find_map(|y| to_ref(to_res(y)).ok())`
+   |
+note: the suggestion might change the behavior of the program when merging `filter` and `map`, because this expression potentially contains side effects and will only execute once
+  --> $DIR/manual_find_map.rs:24:20
+   |
+LL |         .find(|&x| to_ref(to_res(x)).is_ok())
+   |                    ^^^^^^^^^^^^^^^^^
 
 error: `find(..).map(..)` can be simplified as `find_map(..)`
   --> $DIR/manual_find_map.rs:27:10
@@ -49,6 +85,12 @@ LL |           .find(|x| to_ref(to_res(*x)).is_ok())
    |  __________^
 LL | |         .map(|y| to_ref(to_res(y)).unwrap());
    | |____________________________________________^ help: try: `find_map(|y| to_ref(to_res(y)).ok())`
+   |
+note: the suggestion might change the behavior of the program when merging `filter` and `map`, because this expression potentially contains side effects and will only execute once
+  --> $DIR/manual_find_map.rs:27:19
+   |
+LL |         .find(|x| to_ref(to_res(*x)).is_ok())
+   |                   ^^^^^^^^^^^^^^^^^^
 
 error: `find(..).map(..)` can be simplified as `find_map(..)`
   --> $DIR/manual_find_map.rs:33:26
@@ -91,6 +133,12 @@ error: `find(..).map(..)` can be simplified as `find_map(..)`
    |
 LL |     iter::<Option<&String>>().find(|&x| to_ref(x).is_some()).map(|y| to_ref(y).cloned().unwrap());
    |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `find_map(|y| to_ref(y).cloned())`
+   |
+note: the suggestion might change the behavior of the program when merging `filter` and `map`, because this expression potentially contains side effects and will only execute once
+  --> $DIR/manual_find_map.rs:39:41
+   |
+LL |     iter::<Option<&String>>().find(|&x| to_ref(x).is_some()).map(|y| to_ref(y).cloned().unwrap());
+   |                                         ^^^^^^^^^
 
 error: `find(..).map(..)` can be simplified as `find_map(..)`
   --> $DIR/manual_find_map.rs:41:30
@@ -133,6 +181,12 @@ error: `find(..).map(..)` can be simplified as `find_map(..)`
    |
 LL |     iter::<Result<&String, ()>>().find(|&x| to_ref(x).is_ok()).map(|y| to_ref(y).cloned().unwrap());
    |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `find_map(|y| to_ref(y).cloned().ok())`
+   |
+note: the suggestion might change the behavior of the program when merging `filter` and `map`, because this expression potentially contains side effects and will only execute once
+  --> $DIR/manual_find_map.rs:47:45
+   |
+LL |     iter::<Result<&String, ()>>().find(|&x| to_ref(x).is_ok()).map(|y| to_ref(y).cloned().unwrap());
+   |                                             ^^^^^^^^^
 
 error: `find(..).map(..)` can be simplified as `find_map(..)`
   --> $DIR/manual_find_map.rs:95:10

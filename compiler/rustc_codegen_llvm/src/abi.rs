@@ -216,9 +216,7 @@ impl<'ll, 'tcx> ArgAbiExt<'ll, 'tcx> for ArgAbi<'tcx, Ty<'tcx>> {
             // uses it for i16 -> {i8, i8}, but not for i24 -> {i8, i8, i8}.
             let can_store_through_cast_ptr = false;
             if can_store_through_cast_ptr {
-                let cast_ptr_llty = bx.type_ptr_to(cast.llvm_type(bx));
-                let cast_dst = bx.pointercast(dst.llval, cast_ptr_llty);
-                bx.store(val, cast_dst, self.layout.align.abi);
+                bx.store(val, dst.llval, self.layout.align.abi);
             } else {
                 // The actual return type is a struct, but the ABI
                 // adaptation code has cast it into some scalar type. The
@@ -336,22 +334,57 @@ impl<'ll, 'tcx> FnAbiLlvmExt<'ll, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
             PassMode::Direct(_) | PassMode::Pair(..) => self.ret.layout.immediate_llvm_type(cx),
             PassMode::Cast(cast, _) => cast.llvm_type(cx),
             PassMode::Indirect { .. } => {
-                llargument_tys.push(cx.type_ptr_to(self.ret.memory_ty(cx)));
+                llargument_tys.push(cx.type_ptr());
                 cx.type_void()
             }
         };
 
         for arg in args {
+            // Note that the exact number of arguments pushed here is carefully synchronized with
+            // code all over the place, both in the codegen_llvm and codegen_ssa crates. That's how
+            // other code then knows which LLVM argument(s) correspond to the n-th Rust argument.
             let llarg_ty = match &arg.mode {
                 PassMode::Ignore => continue,
-                PassMode::Direct(_) => arg.layout.immediate_llvm_type(cx),
+                PassMode::Direct(_) => {
+                    // ABI-compatible Rust types have the same `layout.abi` (up to validity ranges),
+                    // and for Scalar ABIs the LLVM type is fully determined by `layout.abi`,
+                    // guarnateeing that we generate ABI-compatible LLVM IR. Things get tricky for
+                    // aggregates...
+                    if matches!(arg.layout.abi, abi::Abi::Aggregate { .. }) {
+                        // This really shouldn't happen, since `immediate_llvm_type` will use
+                        // `layout.fields` to turn this Rust type into an LLVM type. This means all
+                        // sorts of Rust type details leak into the ABI. However wasm sadly *does*
+                        // currently use this mode so we have to allow it -- but we absolutely
+                        // shouldn't let any more targets do that.
+                        // (Also see <https://github.com/rust-lang/rust/issues/115666>.)
+                        assert!(
+                            matches!(&*cx.tcx.sess.target.arch, "wasm32" | "wasm64"),
+                            "`PassMode::Direct` for aggregates only allowed on wasm targets\nProblematic type: {:#?}",
+                            arg.layout,
+                        );
+                    }
+                    arg.layout.immediate_llvm_type(cx)
+                }
                 PassMode::Pair(..) => {
+                    // ABI-compatible Rust types have the same `layout.abi` (up to validity ranges),
+                    // so for ScalarPair we can easily be sure that we are generating ABI-compatible
+                    // LLVM IR.
+                    assert!(
+                        matches!(arg.layout.abi, abi::Abi::ScalarPair(..)),
+                        "PassMode::Pair for type {}",
+                        arg.layout.ty
+                    );
                     llargument_tys.push(arg.layout.scalar_pair_element_llvm_type(cx, 0, true));
                     llargument_tys.push(arg.layout.scalar_pair_element_llvm_type(cx, 1, true));
                     continue;
                 }
                 PassMode::Indirect { attrs: _, extra_attrs: Some(_), on_stack: _ } => {
-                    let ptr_ty = cx.tcx.mk_mut_ptr(arg.layout.ty);
+                    assert!(arg.layout.is_unsized());
+                    // Construct the type of a (wide) pointer to `ty`, and pass its two fields.
+                    // Any two ABI-compatible unsized types have the same metadata type and
+                    // moreover the same metadata value leads to the same dynamic size and
+                    // alignment, so this respects ABI compatibility.
+                    let ptr_ty = Ty::new_mut_ptr(cx.tcx, arg.layout.ty);
                     let ptr_layout = cx.layout_of(ptr_ty);
                     llargument_tys.push(ptr_layout.scalar_pair_element_llvm_type(cx, 0, true));
                     llargument_tys.push(ptr_layout.scalar_pair_element_llvm_type(cx, 1, true));
@@ -362,11 +395,11 @@ impl<'ll, 'tcx> FnAbiLlvmExt<'ll, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
                     if *pad_i32 {
                         llargument_tys.push(Reg::i32().llvm_type(cx));
                     }
+                    // Compute the LLVM type we use for this function from the cast type.
+                    // We assume here that ABI-compatible Rust types have the same cast type.
                     cast.llvm_type(cx)
                 }
-                PassMode::Indirect { attrs: _, extra_attrs: None, on_stack: _ } => {
-                    cx.type_ptr_to(arg.memory_ty(cx))
-                }
+                PassMode::Indirect { attrs: _, extra_attrs: None, on_stack: _ } => cx.type_ptr(),
             };
             llargument_tys.push(llarg_ty);
         }
@@ -379,12 +412,7 @@ impl<'ll, 'tcx> FnAbiLlvmExt<'ll, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
     }
 
     fn ptr_to_llvm_type(&self, cx: &CodegenCx<'ll, 'tcx>) -> &'ll Type {
-        unsafe {
-            llvm::LLVMPointerType(
-                self.llvm_type(cx),
-                cx.data_layout().instruction_address_space.0 as c_uint,
-            )
-        }
+        cx.type_ptr_ext(cx.data_layout().instruction_address_space)
     }
 
     fn llvm_cconv(&self) -> llvm::CallConv {
@@ -392,12 +420,15 @@ impl<'ll, 'tcx> FnAbiLlvmExt<'ll, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
     }
 
     fn apply_attrs_llfn(&self, cx: &CodegenCx<'ll, 'tcx>, llfn: &'ll Value) {
-        let mut func_attrs = SmallVec::<[_; 2]>::new();
+        let mut func_attrs = SmallVec::<[_; 3]>::new();
         if self.ret.layout.abi.is_uninhabited() {
             func_attrs.push(llvm::AttributeKind::NoReturn.create_attr(cx.llcx));
         }
         if !self.can_unwind {
             func_attrs.push(llvm::AttributeKind::NoUnwind.create_attr(cx.llcx));
+        }
+        if let Conv::RiscvInterrupt { kind } = self.conv {
+            func_attrs.push(llvm::CreateAttrStringValue(cx.llcx, "interrupt", kind.as_str()));
         }
         attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &{ func_attrs });
 
@@ -574,8 +605,12 @@ impl<'tcx> AbiBuilderMethods<'tcx> for Builder<'_, '_, 'tcx> {
 impl From<Conv> for llvm::CallConv {
     fn from(conv: Conv) -> Self {
         match conv {
-            Conv::C | Conv::Rust | Conv::CCmseNonSecureCall => llvm::CCallConv,
-            Conv::RustCold => llvm::ColdCallConv,
+            Conv::C | Conv::Rust | Conv::CCmseNonSecureCall | Conv::RiscvInterrupt { .. } => {
+                llvm::CCallConv
+            }
+            Conv::Cold => llvm::ColdCallConv,
+            Conv::PreserveMost => llvm::PreserveMost,
+            Conv::PreserveAll => llvm::PreserveAll,
             Conv::AmdGpuKernel => llvm::AmdGpuKernel,
             Conv::AvrInterrupt => llvm::AvrInterrupt,
             Conv::AvrNonBlockingInterrupt => llvm::AvrNonBlockingInterrupt,

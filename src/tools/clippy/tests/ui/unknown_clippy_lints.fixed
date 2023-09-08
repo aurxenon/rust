@@ -1,9 +1,7 @@
-//@run-rustfix
-
 #![warn(clippy::pedantic)]
 // Should suggest lowercase
 #![allow(clippy::all)]
-#![warn(clippy::cmp_nan)]
+#![warn(clippy::cmp_owned)]
 
 // Should suggest similar clippy lint name
 #[warn(clippy::if_not_else)]

@@ -62,6 +62,9 @@ impl Finder {
 }
 
 pub fn check(build: &mut Build) {
+    let skip_target_sanity =
+        env::var_os("BOOTSTRAP_SKIP_TARGET_SANITY").is_some_and(|s| s == "1" || s == "true");
+
     let path = env::var_os("PATH").unwrap_or_default();
     // On Windows, quotes are invalid characters for filename paths, and if
     // one is present as part of the PATH then that can lead to the system
@@ -104,7 +107,7 @@ You should install cmake, or set `download-ci-llvm = true` in the
 than building it.
 "
             );
-            crate::detail_exit(1);
+            crate::exit!(1);
         }
     }
 
@@ -166,7 +169,7 @@ than building it.
         // FIXME: it would be better to refactor this code to split necessary setup from pure sanity
         // checks, and have a regular flag for skipping the latter. Also see
         // <https://github.com/rust-lang/rust/pull/103569#discussion_r1008741742>.
-        if env::var_os("BOOTSTRAP_SKIP_TARGET_SANITY").is_some() {
+        if skip_target_sanity {
             continue;
         }
 
@@ -188,7 +191,7 @@ than building it.
         // Externally configured LLVM requires FileCheck to exist
         let filecheck = build.llvm_filecheck(build.build);
         if !filecheck.starts_with(&build.out) && !filecheck.exists() && build.config.codegen_tests {
-            panic!("FileCheck executable {:?} does not exist", filecheck);
+            panic!("FileCheck executable {filecheck:?} does not exist");
         }
     }
 
@@ -205,8 +208,16 @@ than building it.
             }
         }
 
-        // Make sure musl-root is valid
-        if target.contains("musl") {
+        // Some environments don't want or need these tools, such as when testing Miri.
+        // FIXME: it would be better to refactor this code to split necessary setup from pure sanity
+        // checks, and have a regular flag for skipping the latter. Also see
+        // <https://github.com/rust-lang/rust/pull/103569#discussion_r1008741742>.
+        if skip_target_sanity {
+            continue;
+        }
+
+        // Make sure musl-root is valid.
+        if target.contains("musl") && !target.contains("unikraft") {
             // If this is a native target (host is also musl) and no musl-root is given,
             // fall back to the system toolchain in /usr before giving up
             if build.musl_root(*target).is_none() && build.config.build == *target {
@@ -225,14 +236,6 @@ than building it.
                             be specified in config.toml"
                 ),
             }
-        }
-
-        // Some environments don't want or need these tools, such as when testing Miri.
-        // FIXME: it would be better to refactor this code to split necessary setup from pure sanity
-        // checks, and have a regular flag for skipping the latter. Also see
-        // <https://github.com/rust-lang/rust/pull/103569#discussion_r1008741742>.
-        if env::var_os("BOOTSTRAP_SKIP_TARGET_SANITY").is_some() {
-            continue;
         }
 
         if need_cmake && target.contains("msvc") {

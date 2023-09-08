@@ -149,7 +149,7 @@ pub fn expand_include<'cx>(
                     Ok(None) => {
                         if self.p.token != token::Eof {
                             let token = pprust::token_to_string(&self.p.token);
-                            let msg = format!("expected item, found `{}`", token);
+                            let msg = format!("expected item, found `{token}`");
                             self.p.struct_span_err(self.p.token.span, msg).emit();
                         }
 
@@ -217,7 +217,7 @@ pub fn expand_include_bytes(
     };
     match cx.source_map().load_binary_file(&file) {
         Ok(bytes) => {
-            let expr = cx.expr(sp, ast::ExprKind::IncludedBytes(bytes.into()));
+            let expr = cx.expr(sp, ast::ExprKind::IncludedBytes(bytes));
             base::MacEager::expr(expr)
         }
         Err(e) => {

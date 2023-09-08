@@ -2,7 +2,6 @@ use rustc_errors::{Applicability, Diagnostic, DiagnosticBuilder, ErrorGuaranteed
 use rustc_hir as hir;
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::Node;
-use rustc_middle::hir::map::Map;
 use rustc_middle::mir::{Mutability, Place, PlaceRef, ProjectionElem};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_middle::{
@@ -123,13 +122,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                     item_msg = access_place_desc;
                     debug_assert!(self.body.local_decls[ty::CAPTURE_STRUCT_LOCAL].ty.is_ref());
                     debug_assert!(is_closure_or_generator(
-                        Place::ty_from(
-                            the_place_err.local,
-                            the_place_err.projection,
-                            self.body,
-                            self.infcx.tcx
-                        )
-                        .ty
+                        the_place_err.ty(self.body, self.infcx.tcx).ty
                     ));
 
                     reason = if self.is_upvar_field_projection(access_place.as_ref()).is_some() {
@@ -232,17 +225,17 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                 }
                 if suggest {
                     borrow_spans.var_subdiag(
-                    None,
-                    &mut err,
-                    Some(mir::BorrowKind::Mut { allow_two_phase_borrow: false }),
-                    |_kind, var_span| {
-                        let place = self.describe_any_place(access_place.as_ref());
-                        crate::session_diagnostics::CaptureVarCause::MutableBorrowUsePlaceClosure {
-                            place,
-                            var_span,
-                        }
-                    },
-                );
+                        None,
+                        &mut err,
+                        Some(mir::BorrowKind::Mut { kind: mir::MutBorrowKind::Default }),
+                        |_kind, var_span| {
+                            let place = self.describe_any_place(access_place.as_ref());
+                            crate::session_diagnostics::CaptureVarCause::MutableBorrowUsePlaceClosure {
+                                place,
+                                var_span,
+                            }
+                        },
+                    );
                 }
                 borrow_span
             }
@@ -269,11 +262,8 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
             } => {
                 err.span_label(span, format!("cannot {act}"));
 
-                if let Some(span) = get_mut_span_in_struct_field(
-                    self.infcx.tcx,
-                    Place::ty_from(local, proj_base, self.body, self.infcx.tcx).ty,
-                    *field,
-                ) {
+                let place = Place::ty_from(local, proj_base, self.body, self.infcx.tcx);
+                if let Some(span) = get_mut_span_in_struct_field(self.infcx.tcx, place.ty, *field) {
                     err.span_suggestion_verbose(
                         span,
                         "consider changing this to be mutable",
@@ -300,7 +290,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                             _,
                             mir::Rvalue::Ref(
                                 _,
-                                mir::BorrowKind::Mut { allow_two_phase_borrow: false },
+                                mir::BorrowKind::Mut { kind: mir::MutBorrowKind::Default },
                                 _,
                             ),
                         )),
@@ -416,12 +406,28 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                         _,
                     ) = pat.kind
                 {
-                    err.span_suggestion(
-                        upvar_ident.span,
-                        "consider changing this to be mutable",
-                        format!("mut {}", upvar_ident.name),
-                        Applicability::MachineApplicable,
-                    );
+                    if upvar_ident.name == kw::SelfLower {
+                        for (_, node) in self.infcx.tcx.hir().parent_iter(upvar_hir_id) {
+                            if let Some(fn_decl) = node.fn_decl() {
+                                if !matches!(fn_decl.implicit_self, hir::ImplicitSelfKind::ImmRef | hir::ImplicitSelfKind::MutRef) {
+                                    err.span_suggestion(
+                                        upvar_ident.span,
+                                        "consider changing this to be mutable",
+                                        format!("mut {}", upvar_ident.name),
+                                        Applicability::MachineApplicable,
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        err.span_suggestion(
+                            upvar_ident.span,
+                            "consider changing this to be mutable",
+                            format!("mut {}", upvar_ident.name),
+                            Applicability::MachineApplicable,
+                        );
+                    }
                 }
 
                 let tcx = self.infcx.tcx;
@@ -558,7 +564,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                         }
                     };
                     if let hir::ExprKind::Assign(place, rv, _sp) = expr.kind
-                        && let hir::ExprKind::Index(val, index) = place.kind
+                        && let hir::ExprKind::Index(val, index, _) = place.kind
                         && (expr.span == self.assign_span || place.span == self.assign_span)
                     {
                         // val[index] = rv;
@@ -611,7 +617,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                         );
                         self.suggested = true;
                     } else if let hir::ExprKind::MethodCall(_path, receiver, _, sp) = expr.kind
-                        && let hir::ExprKind::Index(val, index) = receiver.kind
+                        && let hir::ExprKind::Index(val, index, _) = receiver.kind
                         && expr.span == self.assign_span
                     {
                         // val[index].path(args..);
@@ -636,10 +642,8 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
             }
             let hir_map = self.infcx.tcx.hir();
             let def_id = self.body.source.def_id();
-            let hir_id = hir_map.local_def_id_to_hir_id(def_id.as_local().unwrap());
-            let node = hir_map.find(hir_id);
-            let Some(hir::Node::Item(item)) = node else { return; };
-            let hir::ItemKind::Fn(.., body_id) = item.kind else { return; };
+            let Some(local_def_id) = def_id.as_local() else { return };
+            let Some(body_id) = hir_map.maybe_body_owned_by(local_def_id) else { return };
             let body = self.infcx.tcx.hir().body(body_id);
 
             let mut v = V { assign_span: span, err, ty, suggested: false };
@@ -774,94 +778,88 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
 
     // Attempt to search similar mutable associated items for suggestion.
     // In the future, attempt in all path but initially for RHS of for_loop
-    fn suggest_similar_mut_method_for_for_loop(&self, err: &mut Diagnostic) {
+    fn suggest_similar_mut_method_for_for_loop(&self, err: &mut Diagnostic, span: Span) {
         use hir::{
-            BodyId, Expr,
-            ExprKind::{Block, Call, DropTemps, Match, MethodCall},
-            HirId, ImplItem, ImplItemKind, Item, ItemKind,
+            BorrowKind, Expr,
+            ExprKind::{AddrOf, Block, Call, MethodCall},
         };
 
-        fn maybe_body_id_of_fn(hir_map: Map<'_>, id: HirId) -> Option<BodyId> {
-            match hir_map.find(id) {
-                Some(Node::Item(Item { kind: ItemKind::Fn(_, _, body_id), .. }))
-                | Some(Node::ImplItem(ImplItem { kind: ImplItemKind::Fn(_, body_id), .. })) => {
-                    Some(*body_id)
+        let hir_map = self.infcx.tcx.hir();
+        struct Finder<'tcx> {
+            span: Span,
+            expr: Option<&'tcx Expr<'tcx>>,
+        }
+
+        impl<'tcx> Visitor<'tcx> for Finder<'tcx> {
+            fn visit_expr(&mut self, e: &'tcx hir::Expr<'tcx>) {
+                if e.span == self.span && self.expr.is_none() {
+                    self.expr = Some(e);
                 }
-                _ => None,
+                hir::intravisit::walk_expr(self, e);
             }
         }
-        let hir_map = self.infcx.tcx.hir();
-        let mir_body_hir_id = self.mir_hir_id();
-        if let Some(fn_body_id) = maybe_body_id_of_fn(hir_map, mir_body_hir_id) {
-            if let Block(
-                hir::Block {
-                    expr:
-                        Some(Expr {
-                            kind:
-                                DropTemps(Expr {
-                                    kind:
-                                        Match(
-                                            Expr {
-                                                kind:
-                                                    Call(
-                                                        _,
-                                                        [
-                                                            Expr {
-                                                                kind:
-                                                                    MethodCall(path_segment, _, _, span),
-                                                                hir_id,
-                                                                ..
-                                                            },
-                                                            ..,
-                                                        ],
-                                                    ),
-                                                ..
-                                            },
-                                            ..,
-                                        ),
-                                    ..
-                                }),
-                            ..
-                        }),
-                    ..
-                },
-                _,
-            ) = hir_map.body(fn_body_id).value.kind
-            {
-                let opt_suggestions = self
-                    .infcx
-                    .tcx
-                    .typeck(path_segment.hir_id.owner.def_id)
-                    .type_dependent_def_id(*hir_id)
-                    .and_then(|def_id| self.infcx.tcx.impl_of_method(def_id))
-                    .map(|def_id| self.infcx.tcx.associated_items(def_id))
-                    .map(|assoc_items| {
-                        assoc_items
-                            .in_definition_order()
-                            .map(|assoc_item_def| assoc_item_def.ident(self.infcx.tcx))
-                            .filter(|&ident| {
-                                let original_method_ident = path_segment.ident;
-                                original_method_ident != ident
-                                    && ident
-                                        .as_str()
-                                        .starts_with(&original_method_ident.name.to_string())
-                            })
-                            .map(|ident| format!("{ident}()"))
-                            .peekable()
-                    });
+        if let Some(body_id) = hir_map.maybe_body_owned_by(self.mir_def_id())
+            && let Block(block, _) = hir_map.body(body_id).value.kind
+        {
+            // `span` corresponds to the expression being iterated, find the `for`-loop desugared
+            // expression with that span in order to identify potential fixes when encountering a
+            // read-only iterator that should be mutable.
+            let mut v = Finder {
+                span,
+                expr: None,
+            };
+            v.visit_block(block);
+            if let Some(expr) = v.expr && let Call(_, [expr]) = expr.kind {
+                match expr.kind {
+                    MethodCall(path_segment, _, _, span) => {
+                        // We have `for _ in iter.read_only_iter()`, try to
+                        // suggest `for _ in iter.mutable_iter()` instead.
+                        let opt_suggestions = self
+                            .infcx
+                            .tcx
+                            .typeck(path_segment.hir_id.owner.def_id)
+                            .type_dependent_def_id(expr.hir_id)
+                            .and_then(|def_id| self.infcx.tcx.impl_of_method(def_id))
+                            .map(|def_id| self.infcx.tcx.associated_items(def_id))
+                            .map(|assoc_items| {
+                                assoc_items
+                                    .in_definition_order()
+                                    .map(|assoc_item_def| assoc_item_def.ident(self.infcx.tcx))
+                                    .filter(|&ident| {
+                                        let original_method_ident = path_segment.ident;
+                                        original_method_ident != ident
+                                            && ident.as_str().starts_with(
+                                                &original_method_ident.name.to_string(),
+                                            )
+                                    })
+                                    .map(|ident| format!("{ident}()"))
+                                    .peekable()
+                            });
 
-                if let Some(mut suggestions) = opt_suggestions
-                    && suggestions.peek().is_some()
-                {
-                    err.span_suggestions(
-                        *span,
-                        "use mutable method",
-                        suggestions,
-                        Applicability::MaybeIncorrect,
-                    );
+                        if let Some(mut suggestions) = opt_suggestions
+                            && suggestions.peek().is_some()
+                        {
+                            err.span_suggestions(
+                                span,
+                                "use mutable method",
+                                suggestions,
+                                Applicability::MaybeIncorrect,
+                            );
+                        }
+                    }
+                    AddrOf(BorrowKind::Ref, Mutability::Not, expr) => {
+                        // We have `for _ in &i`, suggest `for _ in &mut i`.
+                        err.span_suggestion_verbose(
+                            expr.span.shrink_to_lo(),
+                            "use a mutable iterator instead",
+                            "mut ".to_string(),
+                            Applicability::MachineApplicable,
+                        );
+                    }
+                    _ => {}
                 }
             }
-        };
+        }
     }
 
     /// Targeted error when encountering an `FnMut` closure where an `Fn` closure was expected.
@@ -1007,9 +1005,10 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                 match opt_assignment_rhs_span.and_then(|s| s.desugaring_kind()) {
                     // on for loops, RHS points to the iterator part
                     Some(DesugaringKind::ForLoop) => {
-                        self.suggest_similar_mut_method_for_for_loop(err);
+                        let span = opt_assignment_rhs_span.unwrap();
+                        self.suggest_similar_mut_method_for_for_loop(err, span);
                         err.span_label(
-                            opt_assignment_rhs_span.unwrap(),
+                            span,
                             format!("this iterator yields `{pointer_sigil}` {pointer_desc}s",),
                         );
                         None
@@ -1088,46 +1087,45 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                 }
                 let hir_map = self.infcx.tcx.hir();
                 let def_id = self.body.source.def_id();
-                let hir_id = hir_map.local_def_id_to_hir_id(def_id.expect_local());
-                let node = hir_map.find(hir_id);
-                let hir_id = if let Some(hir::Node::Item(item)) = node
-                && let hir::ItemKind::Fn(.., body_id) = item.kind
-            {
-                let body = hir_map.body(body_id);
-                let mut v = BindingFinder {
-                    span: err_label_span,
-                    hir_id: None,
+                let hir_id = if let Some(local_def_id) = def_id.as_local() &&
+                    let Some(body_id) = hir_map.maybe_body_owned_by(local_def_id)
+                {
+                    let body = hir_map.body(body_id);
+                    let mut v = BindingFinder {
+                        span: err_label_span,
+                        hir_id: None,
+                    };
+                    v.visit_body(body);
+                    v.hir_id
+                } else {
+                    None
                 };
-                v.visit_body(body);
-                v.hir_id
-            } else {
-                None
-            };
+
                 if let Some(hir_id) = hir_id
                 && let Some(hir::Node::Local(local)) = hir_map.find(hir_id)
-            {
-                let (changing, span, sugg) = match local.ty {
-                    Some(ty) => ("changing", ty.span, message),
-                    None => (
-                        "specifying",
-                        local.pat.span.shrink_to_hi(),
-                        format!(": {message}"),
-                    ),
-                };
-                err.span_suggestion_verbose(
-                    span,
-                    format!("consider {changing} this binding's type"),
-                    sugg,
-                    Applicability::HasPlaceholders,
-                );
-            } else {
-                err.span_label(
-                    err_label_span,
-                    format!(
-                        "consider changing this binding's type to be: `{message}`"
-                    ),
-                );
-            }
+                {
+                    let (changing, span, sugg) = match local.ty {
+                        Some(ty) => ("changing", ty.span, message),
+                        None => (
+                            "specifying",
+                            local.pat.span.shrink_to_hi(),
+                            format!(": {message}"),
+                        ),
+                    };
+                    err.span_suggestion_verbose(
+                        span,
+                        format!("consider {changing} this binding's type"),
+                        sugg,
+                        Applicability::HasPlaceholders,
+                    );
+                } else {
+                    err.span_label(
+                        err_label_span,
+                        format!(
+                            "consider changing this binding's type to be: `{message}`"
+                        ),
+                    );
+                }
             }
             None => {}
         }

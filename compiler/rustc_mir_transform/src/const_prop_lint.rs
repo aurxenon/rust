@@ -7,15 +7,16 @@ use either::Left;
 
 use rustc_const_eval::interpret::Immediate;
 use rustc_const_eval::interpret::{
-    self, InterpCx, InterpResult, LocalValue, MemoryKind, OpTy, Scalar, StackPopCleanup,
+    InterpCx, InterpResult, MemoryKind, OpTy, Scalar, StackPopCleanup,
 };
+use rustc_const_eval::ReportErrorExt;
 use rustc_hir::def::DefKind;
 use rustc_hir::HirId;
 use rustc_index::bit_set::BitSet;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
 use rustc_middle::ty::layout::{LayoutError, LayoutOf, LayoutOfHelpers, TyAndLayout};
-use rustc_middle::ty::InternalSubsts;
+use rustc_middle::ty::GenericArgs;
 use rustc_middle::ty::{
     self, ConstInt, Instance, ParamEnv, ScalarInt, Ty, TyCtxt, TypeVisitableExt,
 };
@@ -38,6 +39,10 @@ pub struct ConstProp;
 
 impl<'tcx> MirLint<'tcx> for ConstProp {
     fn run_lint(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
+        if body.tainted_by_errors.is_some() {
+            return;
+        }
+
         // will be evaluated by miri and produce its errors there
         if body.source.promoted.is_some() {
             return;
@@ -54,7 +59,7 @@ impl<'tcx> MirLint<'tcx> for ConstProp {
             return;
         }
 
-        let is_generator = tcx.type_of(def_id.to_def_id()).subst_identity().is_generator();
+        let is_generator = tcx.type_of(def_id.to_def_id()).instantiate_identity().is_generator();
         // FIXME(welseywiser) const prop doesn't work on generators because of query cycles
         // computing their layout.
         if is_generator {
@@ -170,7 +175,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         tcx: TyCtxt<'tcx>,
     ) -> ConstPropagator<'mir, 'tcx> {
         let def_id = body.source.def_id();
-        let substs = &InternalSubsts::identity_for_item(tcx, def_id);
+        let args = &GenericArgs::identity_for_item(tcx, def_id);
         let param_env = tcx.param_env_reveal_all_normalized(def_id);
 
         let can_const_prop = CanConstProp::check(tcx, param_env, body);
@@ -182,7 +187,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         );
 
         let ret_layout = ecx
-            .layout_of(body.bound_return_ty().subst(tcx, substs))
+            .layout_of(body.bound_return_ty().instantiate(tcx, args))
             .ok()
             // Don't bother allocating memory for large values.
             // I don't know how return types can seem to be unsized but this happens in the
@@ -198,12 +203,21 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
             .into();
 
         ecx.push_stack_frame(
-            Instance::new(def_id, substs),
+            Instance::new(def_id, args),
             dummy_body,
             &ret,
             StackPopCleanup::Root { cleanup: false },
         )
         .expect("failed to push initial stack frame");
+
+        for local in body.local_decls.indices() {
+            // Mark everything initially live.
+            // This is somewhat dicey since some of them might be unsized and it is incoherent to
+            // mark those as live... We rely on `local_to_place`/`local_to_op` in the interpreter
+            // stopping us before those unsized immediates can cause issues deeper in the
+            // interpreter.
+            ecx.frame_mut().locals[local].make_live_uninit();
+        }
 
         ConstPropagator {
             ecx,
@@ -225,14 +239,18 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
     fn get_const(&self, place: Place<'tcx>) -> Option<OpTy<'tcx>> {
         let op = match self.ecx.eval_place_to_op(place, None) {
             Ok(op) => {
-                if matches!(*op, interpret::Operand::Immediate(Immediate::Uninit)) {
+                if op
+                    .as_mplace_or_imm()
+                    .right()
+                    .is_some_and(|imm| matches!(*imm, Immediate::Uninit))
+                {
                     // Make sure nobody accidentally uses this value.
                     return None;
                 }
                 op
             }
             Err(e) => {
-                trace!("get_const failed: {}", e);
+                trace!("get_const failed: {:?}", e.into_kind().debug());
                 return None;
             }
         };
@@ -248,8 +266,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
     /// Remove `local` from the pool of `Locals`. Allows writing to them,
     /// but not reading from them anymore.
     fn remove_const(ecx: &mut InterpCx<'mir, 'tcx, ConstPropMachine<'mir, 'tcx>>, local: Local) {
-        ecx.frame_mut().locals[local].value =
-            LocalValue::Live(interpret::Operand::Immediate(interpret::Immediate::Uninit));
+        ecx.frame_mut().locals[local].make_live_uninit();
         ecx.machine.written_only_inside_own_block_locals.remove(&local);
     }
 
@@ -273,7 +290,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                 assert!(
                     !error.kind().formatted_string(),
                     "const-prop encountered formatting error: {}",
-                    error
+                    self.ecx.format_error(error),
                 );
                 None
             }
@@ -494,7 +511,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         trace!("assertion on {:?} should be {:?}", value, expected);
 
         let expected = Scalar::from_bool(expected);
-        let value_const = self.use_ecx(location, |this| this.ecx.read_scalar(&value))?;
+        let value_const = self.use_ecx(location, |this| this.ecx.read_scalar(value))?;
 
         if expected != value_const {
             // Poison all places this operand references so that further code
@@ -645,12 +662,12 @@ impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
             }
             StatementKind::StorageLive(local) => {
                 let frame = self.ecx.frame_mut();
-                frame.locals[local].value =
-                    LocalValue::Live(interpret::Operand::Immediate(interpret::Immediate::Uninit));
+                frame.locals[local].make_live_uninit();
             }
             StatementKind::StorageDead(local) => {
                 let frame = self.ecx.frame_mut();
-                frame.locals[local].value = LocalValue::Dead;
+                // We don't actually track liveness, so the local remains live. But forget its value.
+                frame.locals[local].make_live_uninit();
             }
             _ => {}
         }
@@ -664,7 +681,7 @@ impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
             }
             TerminatorKind::SwitchInt { ref discr, ref targets } => {
                 if let Some(ref value) = self.eval_operand(&discr, location)
-                  && let Some(value_const) = self.use_ecx(location, |this| this.ecx.read_scalar(&value))
+                  && let Some(value_const) = self.use_ecx(location, |this| this.ecx.read_scalar(value))
                   && let Ok(constant) = value_const.try_to_int()
                   && let Ok(constant) = constant.to_bits(constant.size())
                 {
@@ -678,8 +695,8 @@ impl<'tcx> Visitor<'tcx> for ConstPropagator<'_, 'tcx> {
             }
             // None of these have Operands to const-propagate.
             TerminatorKind::Goto { .. }
-            | TerminatorKind::Resume
-            | TerminatorKind::Terminate
+            | TerminatorKind::UnwindResume
+            | TerminatorKind::UnwindTerminate(_)
             | TerminatorKind::Return
             | TerminatorKind::Unreachable
             | TerminatorKind::Drop { .. }

@@ -1,4 +1,5 @@
 use crate::dep_graph::DepKind;
+use crate::query::plumbing::CyclePlaceholder;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{pluralize, struct_span_err, Applicability, MultiSpan};
 use rustc_hir as hir;
@@ -8,20 +9,38 @@ use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_query_system::query::QueryInfo;
 use rustc_query_system::Value;
 use rustc_span::def_id::LocalDefId;
-use rustc_span::Span;
+use rustc_span::{ErrorGuaranteed, Span};
 
 use std::fmt::Write;
 
 impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for Ty<'_> {
-    fn from_cycle_error(tcx: TyCtxt<'tcx>, _: &[QueryInfo<DepKind>]) -> Self {
+    fn from_cycle_error(
+        tcx: TyCtxt<'tcx>,
+        _: &[QueryInfo<DepKind>],
+        guar: ErrorGuaranteed,
+    ) -> Self {
         // SAFETY: This is never called when `Self` is not `Ty<'tcx>`.
         // FIXME: Represent the above fact in the trait system somehow.
-        unsafe { std::mem::transmute::<Ty<'tcx>, Ty<'_>>(tcx.ty_error_misc()) }
+        unsafe { std::mem::transmute::<Ty<'tcx>, Ty<'_>>(Ty::new_error(tcx, guar)) }
+    }
+}
+
+impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for Result<ty::EarlyBinder<Ty<'_>>, CyclePlaceholder> {
+    fn from_cycle_error(
+        _tcx: TyCtxt<'tcx>,
+        _: &[QueryInfo<DepKind>],
+        guar: ErrorGuaranteed,
+    ) -> Self {
+        Err(CyclePlaceholder(guar))
     }
 }
 
 impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for ty::SymbolName<'_> {
-    fn from_cycle_error(tcx: TyCtxt<'tcx>, _: &[QueryInfo<DepKind>]) -> Self {
+    fn from_cycle_error(
+        tcx: TyCtxt<'tcx>,
+        _: &[QueryInfo<DepKind>],
+        _guar: ErrorGuaranteed,
+    ) -> Self {
         // SAFETY: This is never called when `Self` is not `SymbolName<'tcx>`.
         // FIXME: Represent the above fact in the trait system somehow.
         unsafe {
@@ -33,8 +52,12 @@ impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for ty::SymbolName<'_> {
 }
 
 impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for ty::Binder<'_, ty::FnSig<'_>> {
-    fn from_cycle_error(tcx: TyCtxt<'tcx>, stack: &[QueryInfo<DepKind>]) -> Self {
-        let err = tcx.ty_error_misc();
+    fn from_cycle_error(
+        tcx: TyCtxt<'tcx>,
+        stack: &[QueryInfo<DepKind>],
+        guar: ErrorGuaranteed,
+    ) -> Self {
+        let err = Ty::new_error(tcx, guar);
 
         let arity = if let Some(frame) = stack.get(0)
             && frame.query.dep_kind == DepKind::fn_sig
@@ -63,7 +86,11 @@ impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for ty::Binder<'_, ty::FnSig<'_>> {
 }
 
 impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for Representability {
-    fn from_cycle_error(tcx: TyCtxt<'tcx>, cycle: &[QueryInfo<DepKind>]) -> Self {
+    fn from_cycle_error(
+        tcx: TyCtxt<'tcx>,
+        cycle: &[QueryInfo<DepKind>],
+        _guar: ErrorGuaranteed,
+    ) -> Self {
         let mut item_and_field_ids = Vec::new();
         let mut representable_ids = FxHashSet::default();
         for info in cycle {
@@ -95,20 +122,36 @@ impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for Representability {
 }
 
 impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for ty::EarlyBinder<Ty<'_>> {
-    fn from_cycle_error(tcx: TyCtxt<'tcx>, cycle: &[QueryInfo<DepKind>]) -> Self {
-        ty::EarlyBinder(Ty::from_cycle_error(tcx, cycle))
+    fn from_cycle_error(
+        tcx: TyCtxt<'tcx>,
+        cycle: &[QueryInfo<DepKind>],
+        guar: ErrorGuaranteed,
+    ) -> Self {
+        ty::EarlyBinder::bind(Ty::from_cycle_error(tcx, cycle, guar))
     }
 }
 
 impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for ty::EarlyBinder<ty::Binder<'_, ty::FnSig<'_>>> {
-    fn from_cycle_error(tcx: TyCtxt<'tcx>, cycle: &[QueryInfo<DepKind>]) -> Self {
-        ty::EarlyBinder(ty::Binder::from_cycle_error(tcx, cycle))
+    fn from_cycle_error(
+        tcx: TyCtxt<'tcx>,
+        cycle: &[QueryInfo<DepKind>],
+        guar: ErrorGuaranteed,
+    ) -> Self {
+        ty::EarlyBinder::bind(ty::Binder::from_cycle_error(tcx, cycle, guar))
     }
 }
 
-impl<'tcx, T> Value<TyCtxt<'tcx>, DepKind> for Result<T, ty::layout::LayoutError<'_>> {
-    fn from_cycle_error(_tcx: TyCtxt<'tcx>, _cycle: &[QueryInfo<DepKind>]) -> Self {
-        Err(ty::layout::LayoutError::Cycle)
+impl<'tcx, T> Value<TyCtxt<'tcx>, DepKind> for Result<T, &'_ ty::layout::LayoutError<'_>> {
+    fn from_cycle_error(
+        _tcx: TyCtxt<'tcx>,
+        _cycle: &[QueryInfo<DepKind>],
+        _guar: ErrorGuaranteed,
+    ) -> Self {
+        // tcx.arena.alloc cannot be used because we are not allowed to use &'tcx LayoutError under
+        // min_specialization. Since this is an error path anyways, leaking doesn't matter (and really,
+        // tcx.arena.alloc is pretty much equal to leaking).
+        // FIXME: `Cycle` should carry the ErrorGuaranteed
+        Err(Box::leak(Box::new(ty::layout::LayoutError::Cycle)))
     }
 }
 
@@ -206,7 +249,7 @@ fn find_item_ty_spans(
     match ty.kind {
         hir::TyKind::Path(hir::QPath::Resolved(_, path)) => {
             if let Res::Def(kind, def_id) = path.res
-                && kind != DefKind::TyAlias {
+                && !matches!(kind, DefKind::TyAlias { .. }) {
                 let check_params = def_id.as_local().map_or(true, |def_id| {
                     if def_id == needle {
                         spans.push(ty.span);

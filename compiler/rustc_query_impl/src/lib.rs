@@ -11,6 +11,7 @@
 #![allow(rustc::potential_query_instability, unused_parens)]
 #![deny(rustc::untranslatable_diagnostic)]
 #![deny(rustc::diagnostic_outside_of_impl)]
+#![allow(internal_features)]
 
 #[macro_use]
 extern crate rustc_middle;
@@ -40,7 +41,7 @@ use rustc_query_system::query::{
 };
 use rustc_query_system::HandleCycleError;
 use rustc_query_system::Value;
-use rustc_span::Span;
+use rustc_span::{ErrorGuaranteed, Span};
 
 #[macro_use]
 mod plumbing;
@@ -145,8 +146,9 @@ where
         self,
         tcx: TyCtxt<'tcx>,
         cycle: &[QueryInfo<DepKind>],
+        guar: ErrorGuaranteed,
     ) -> Self::Value {
-        (self.dynamic.value_from_cycle_error)(tcx, cycle)
+        (self.dynamic.value_from_cycle_error)(tcx, cycle, guar)
     }
 
     #[inline(always)]

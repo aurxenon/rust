@@ -13,6 +13,7 @@ use rustc_ast::*;
 use rustc_ast::{walk_list, StaticItem};
 use rustc_ast_pretty::pprust::{self, State};
 use rustc_data_structures::fx::FxIndexMap;
+use rustc_feature::Features;
 use rustc_macros::Subdiagnostic;
 use rustc_parse::validate_attr;
 use rustc_session::lint::builtin::{
@@ -45,6 +46,7 @@ enum DisallowTildeConstContext<'a> {
 
 struct AstValidator<'a> {
     session: &'a Session,
+    features: &'a Features,
 
     /// The span of the `extern` in an `extern { ... }` block, if any.
     extern_mod: Option<&'a Item>,
@@ -136,40 +138,42 @@ impl<'a> AstValidator<'a> {
         }
     }
 
-    fn check_gat_where(
+    fn check_type_alias_where_clause_location(
         &mut self,
-        id: NodeId,
-        before_predicates: &[WherePredicate],
-        where_clauses: (ast::TyAliasWhereClause, ast::TyAliasWhereClause),
-    ) {
-        if !before_predicates.is_empty() {
-            let mut state = State::new();
-            if !where_clauses.1.0 {
-                state.space();
-                state.word_space("where");
-            } else {
+        ty_alias: &TyAlias,
+    ) -> Result<(), errors::WhereClauseBeforeTypeAlias> {
+        let before_predicates =
+            ty_alias.generics.where_clause.predicates.split_at(ty_alias.where_predicates_split).0;
+
+        if ty_alias.ty.is_none() || before_predicates.is_empty() {
+            return Ok(());
+        }
+
+        let mut state = State::new();
+        if !ty_alias.where_clauses.1.0 {
+            state.space();
+            state.word_space("where");
+        } else {
+            state.word_space(",");
+        }
+        let mut first = true;
+        for p in before_predicates {
+            if !first {
                 state.word_space(",");
             }
-            let mut first = true;
-            for p in before_predicates.iter() {
-                if !first {
-                    state.word_space(",");
-                }
-                first = false;
-                state.print_where_predicate(p);
-            }
-            let suggestion = state.s.eof();
-            self.lint_buffer.buffer_lint_with_diagnostic(
-                DEPRECATED_WHERE_CLAUSE_LOCATION,
-                id,
-                where_clauses.0.1,
-                fluent::ast_passes_deprecated_where_clause_location,
-                BuiltinLintDiagnostics::DeprecatedWhereclauseLocation(
-                    where_clauses.1.1.shrink_to_hi(),
-                    suggestion,
-                ),
-            );
+            first = false;
+            state.print_where_predicate(p);
         }
+
+        let span = ty_alias.where_clauses.0.1;
+        Err(errors::WhereClauseBeforeTypeAlias {
+            span,
+            sugg: errors::WhereClauseBeforeTypeAliasSugg {
+                left: span,
+                snippet: state.s.eof(),
+                right: ty_alias.where_clauses.1.1.shrink_to_hi(),
+            },
+        })
     }
 
     fn with_impl_trait(&mut self, outer: Option<Span>, f: impl FnOnce(&mut Self)) {
@@ -219,7 +223,24 @@ impl<'a> AstValidator<'a> {
                     }
                 }
             }
+            TyKind::AnonStruct(ref fields, ..) | TyKind::AnonUnion(ref fields, ..) => {
+                walk_list!(self, visit_field_def, fields)
+            }
             _ => visit::walk_ty(self, t),
+        }
+    }
+
+    fn visit_struct_field_def(&mut self, field: &'a FieldDef) {
+        if let Some(ident) = field.ident &&
+            ident.name == kw::Underscore {
+                self.check_unnamed_field_ty(&field.ty, ident.span);
+                self.visit_vis(&field.vis);
+                self.visit_ident(ident);
+                self.visit_ty_common(&field.ty);
+                self.walk_ty(&field.ty);
+                walk_list!(self, visit_attribute, &field.attrs);
+        } else {
+            self.visit_field_def(field);
         }
     }
 
@@ -257,6 +278,42 @@ impl<'a> AstValidator<'a> {
                 }
                 _ => report_err(pat.span, None, false),
             }
+        }
+    }
+
+    fn check_unnamed_field_ty(&self, ty: &Ty, span: Span) {
+        if matches!(
+            &ty.kind,
+            // We already checked for `kw::Underscore` before calling this function,
+            // so skip the check
+            TyKind::AnonStruct(..) | TyKind::AnonUnion(..)
+            // If the anonymous field contains a Path as type, we can't determine
+            // if the path is a valid struct or union, so skip the check
+            | TyKind::Path(..)
+        ) {
+            return;
+        }
+        self.err_handler().emit_err(errors::InvalidUnnamedFieldTy { span, ty_span: ty.span });
+    }
+
+    fn deny_anon_struct_or_union(&self, ty: &Ty) {
+        let struct_or_union = match &ty.kind {
+            TyKind::AnonStruct(..) => "struct",
+            TyKind::AnonUnion(..) => "union",
+            _ => return,
+        };
+        self.err_handler()
+            .emit_err(errors::AnonStructOrUnionNotAllowed { struct_or_union, span: ty.span });
+    }
+
+    fn deny_unnamed_field(&self, field: &FieldDef) {
+        if let Some(ident) = field.ident &&
+            ident.name == kw::Underscore {
+                self.err_handler()
+                    .emit_err(errors::InvalidUnnamedField {
+                        span: field.span,
+                        ident_span: ident.span
+                    });
         }
     }
 
@@ -364,7 +421,12 @@ impl<'a> AstValidator<'a> {
         self.err_handler().emit_err(errors::BoundInContext { span, ctx });
     }
 
-    fn check_foreign_ty_genericless(&self, generics: &Generics, where_span: Span) {
+    fn check_foreign_ty_genericless(
+        &self,
+        generics: &Generics,
+        before_where_clause: &TyAliasWhereClause,
+        after_where_clause: &TyAliasWhereClause,
+    ) {
         let cannot_have = |span, descr, remove_descr| {
             self.err_handler().emit_err(errors::ExternTypesCannotHave {
                 span,
@@ -378,9 +440,14 @@ impl<'a> AstValidator<'a> {
             cannot_have(generics.span, "generic parameters", "generic parameters");
         }
 
-        if !generics.where_clause.predicates.is_empty() {
-            cannot_have(where_span, "`where` clauses", "`where` clause");
-        }
+        let check_where_clause = |where_clause: &TyAliasWhereClause| {
+            if let TyAliasWhereClause(true, where_clause_span) = where_clause {
+                cannot_have(*where_clause_span, "`where` clauses", "`where` clause");
+            }
+        };
+
+        check_where_clause(before_where_clause);
+        check_where_clause(after_where_clause);
     }
 
     fn check_foreign_kind_bodyless(&self, ident: Ident, kind: &str, body: Option<Span>) {
@@ -613,13 +680,12 @@ impl<'a> AstValidator<'a> {
     fn maybe_lint_missing_abi(&mut self, span: Span, id: NodeId) {
         // FIXME(davidtwco): This is a hack to detect macros which produce spans of the
         // call site which do not have a macro backtrace. See #61963.
-        let is_macro_callsite = self
+        if self
             .session
             .source_map()
             .span_to_snippet(span)
-            .map(|snippet| snippet.starts_with("#["))
-            .unwrap_or(true);
-        if !is_macro_callsite {
+            .is_ok_and(|snippet| !snippet.starts_with("#["))
+        {
             self.lint_buffer.buffer_lint_with_diagnostic(
                 MISSING_ABI,
                 id,
@@ -650,7 +716,7 @@ fn validate_generic_param_order(
             GenericParamKind::Type { .. } => (ParamKindOrd::TypeOrConst, ident.to_string()),
             GenericParamKind::Const { ty, .. } => {
                 let ty = pprust::ty_to_string(ty);
-                (ParamKindOrd::TypeOrConst, format!("const {}: {}", ident, ty))
+                (ParamKindOrd::TypeOrConst, format!("const {ident}: {ty}"))
             }
         };
         param_idents.push((kind, ord_kind, bounds, idx, ident));
@@ -776,6 +842,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
 
     fn visit_ty(&mut self, ty: &'a Ty) {
         self.visit_ty_common(ty);
+        self.deny_anon_struct_or_union(ty);
         self.walk_ty(ty)
     }
 
@@ -790,6 +857,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
     }
 
     fn visit_field_def(&mut self, field: &'a FieldDef) {
+        self.deny_unnamed_field(field);
         visit::walk_field_def(self, field)
     }
 
@@ -982,9 +1050,37 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                     self.check_mod_file_item_asciionly(item.ident);
                 }
             }
-            ItemKind::Union(vdata, ..) => {
+            ItemKind::Struct(vdata, generics) => match vdata {
+                // Duplicating the `Visitor` logic allows catching all cases
+                // of `Anonymous(Struct, Union)` outside of a field struct or union.
+                //
+                // Inside `visit_ty` the validator catches every `Anonymous(Struct, Union)` it
+                // encounters, and only on `ItemKind::Struct` and `ItemKind::Union`
+                // it uses `visit_ty_common`, which doesn't contain that specific check.
+                VariantData::Struct(fields, ..) => {
+                    self.visit_vis(&item.vis);
+                    self.visit_ident(item.ident);
+                    self.visit_generics(generics);
+                    walk_list!(self, visit_struct_field_def, fields);
+                    walk_list!(self, visit_attribute, &item.attrs);
+                    return;
+                }
+                _ => {}
+            },
+            ItemKind::Union(vdata, generics) => {
                 if vdata.fields().is_empty() {
                     self.err_handler().emit_err(errors::FieldlessUnion { span: item.span });
+                }
+                match vdata {
+                    VariantData::Struct(fields, ..) => {
+                        self.visit_vis(&item.vis);
+                        self.visit_ident(item.ident);
+                        self.visit_generics(generics);
+                        walk_list!(self, visit_struct_field_def, fields);
+                        walk_list!(self, visit_attribute, &item.attrs);
+                        return;
+                    }
+                    _ => {}
                 }
             }
             ItemKind::Const(box ConstItem { defaultness, expr: None, .. }) => {
@@ -1000,7 +1096,9 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                     replace_span: self.ending_semi_or_hi(item.span),
                 });
             }
-            ItemKind::TyAlias(box TyAlias { defaultness, where_clauses, bounds, ty, .. }) => {
+            ItemKind::TyAlias(
+                ty_alias @ box TyAlias { defaultness, bounds, where_clauses, ty, .. },
+            ) => {
                 self.check_defaultness(item.span, *defaultness);
                 if ty.is_none() {
                     self.session.emit_err(errors::TyAliasWithoutBody {
@@ -1009,9 +1107,16 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                     });
                 }
                 self.check_type_no_bounds(bounds, "this context");
-                if where_clauses.1.0 {
-                    self.err_handler()
-                        .emit_err(errors::WhereAfterTypeAlias { span: where_clauses.1.1 });
+
+                if self.features.lazy_type_alias {
+                    if let Err(err) = self.check_type_alias_where_clause_location(ty_alias) {
+                        self.err_handler().emit_err(err);
+                    }
+                } else if where_clauses.1.0 {
+                    self.err_handler().emit_err(errors::WhereClauseAfterTypeAlias {
+                        span: where_clauses.1.1,
+                        help: self.session.is_nightly_build().then_some(()),
+                    });
                 }
             }
             _ => {}
@@ -1039,7 +1144,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                 self.check_defaultness(fi.span, *defaultness);
                 self.check_foreign_kind_bodyless(fi.ident, "type", ty.as_ref().map(|b| b.span));
                 self.check_type_no_bounds(bounds, "`extern` blocks");
-                self.check_foreign_ty_genericless(generics, where_clauses.0.1);
+                self.check_foreign_ty_genericless(generics, &where_clauses.0, &where_clauses.1);
                 self.check_foreign_item_ascii_only(fi.ident);
             }
             ForeignItemKind::Static(_, _, body) => {
@@ -1291,14 +1396,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                         });
                     }
                 }
-                AssocItemKind::Type(box TyAlias {
-                    generics,
-                    where_clauses,
-                    where_predicates_split,
-                    bounds,
-                    ty,
-                    ..
-                }) => {
+                AssocItemKind::Type(box TyAlias { bounds, ty, .. }) => {
                     if ty.is_none() {
                         self.session.emit_err(errors::AssocTypeWithoutBody {
                             span: item.span,
@@ -1306,16 +1404,24 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                         });
                     }
                     self.check_type_no_bounds(bounds, "`impl`s");
-                    if ty.is_some() {
-                        self.check_gat_where(
-                            item.id,
-                            generics.where_clause.predicates.split_at(*where_predicates_split).0,
-                            *where_clauses,
-                        );
-                    }
                 }
                 _ => {}
             }
+        }
+
+        if let AssocItemKind::Type(ty_alias) = &item.kind
+            && let Err(err) = self.check_type_alias_where_clause_location(ty_alias)
+        {
+            self.lint_buffer.buffer_lint_with_diagnostic(
+                DEPRECATED_WHERE_CLAUSE_LOCATION,
+                item.id,
+                err.span,
+                fluent::ast_passes_deprecated_where_clause_location,
+                BuiltinLintDiagnostics::DeprecatedWhereclauseLocation(
+                    err.sugg.right,
+                    err.sugg.snippet,
+                ),
+            );
         }
 
         if ctxt == AssocCtxt::Trait || self.in_trait_impl {
@@ -1453,15 +1559,12 @@ fn deny_equality_constraints(
                                             let Some(arg) = args.args.last() else {
                                                 continue;
                                             };
-                                            (
-                                                format!(", {} = {}", assoc, ty),
-                                                arg.span().shrink_to_hi(),
-                                            )
+                                            (format!(", {assoc} = {ty}"), arg.span().shrink_to_hi())
                                         }
                                         _ => continue,
                                     },
                                     None => (
-                                        format!("<{} = {}>", assoc, ty),
+                                        format!("<{assoc} = {ty}>"),
                                         trait_segment.span().shrink_to_hi(),
                                     ),
                                 };
@@ -1482,9 +1585,15 @@ fn deny_equality_constraints(
     this.err_handler().emit_err(err);
 }
 
-pub fn check_crate(session: &Session, krate: &Crate, lints: &mut LintBuffer) -> bool {
+pub fn check_crate(
+    session: &Session,
+    features: &Features,
+    krate: &Crate,
+    lints: &mut LintBuffer,
+) -> bool {
     let mut validator = AstValidator {
         session,
+        features,
         extern_mod: None,
         in_trait_impl: false,
         in_const_trait_impl: false,

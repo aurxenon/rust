@@ -398,7 +398,7 @@ pub(crate) enum CaptureReasonSuggest<'tcx> {
     #[suggestion(
         borrowck_suggest_create_freash_reborrow,
         applicability = "maybe-incorrect",
-        code = "as_mut().",
+        code = ".as_mut()",
         style = "verbose"
     )]
     FreshReborrow {
@@ -451,4 +451,11 @@ pub(crate) enum TypeNoCopy<'a, 'tcx> {
     },
     #[note(borrowck_ty_no_impl_copy)]
     Note { is_partial_move: bool, ty: Ty<'tcx>, place: &'a str },
+}
+
+#[derive(Diagnostic)]
+#[diag(borrowck_simd_shuffle_last_const)]
+pub(crate) struct SimdShuffleLastConst {
+    #[primary_span]
+    pub span: Span,
 }

@@ -9,7 +9,7 @@
 //! This includes changes in the stability of the constness.
 //!
 //! In order to make an intrinsic usable at compile-time, one needs to copy the implementation
-//! from <https://github.com/rust-lang/miri/blob/master/src/shims/intrinsics.rs> to
+//! from <https://github.com/rust-lang/miri/blob/master/src/shims/intrinsics> to
 //! <https://github.com/rust-lang/rust/blob/master/compiler/rustc_const_eval/src/interpret/intrinsics.rs> and add a
 //! `#[rustc_const_unstable(feature = "const_such_and_such", issue = "01234")]` to the intrinsic declaration.
 //!
@@ -1057,7 +1057,7 @@ extern "rust-intrinsic" {
     #[rustc_const_unstable(feature = "const_type_id", issue = "77125")]
     #[rustc_safe_intrinsic]
     #[rustc_nounwind]
-    pub fn type_id<T: ?Sized + 'static>() -> u64;
+    pub fn type_id<T: ?Sized + 'static>() -> u128;
 
     /// A guard for unsafe functions that cannot ever be executed if `T` is uninhabited:
     /// This will statically either panic, or do nothing.
@@ -1130,7 +1130,10 @@ extern "rust-intrinsic" {
     /// may lead to unexpected and unstable compilation results. This makes `transmute` **incredibly
     /// unsafe**. `transmute` should be the absolute last resort.
     ///
-    /// Transmuting pointers to integers in a `const` context is [undefined behavior][ub].
+    /// Transmuting pointers *to* integers in a `const` context is [undefined behavior][ub],
+    /// unless the pointer was originally created *from* an integer.
+    /// (That includes this function specifically, integer-to-pointer casts, and helpers like [`invalid`][crate::ptr::invalid],
+    /// but also semantically-equivalent conversions such as punning through `repr(C)` union fields.)
     /// Any attempt to use the resulting value for integer operations will abort const-evaluation.
     /// (And even outside `const`, such transmutation is touching on many unspecified aspects of the
     /// Rust memory model and should be avoided. See below for alternatives.)
@@ -1385,7 +1388,6 @@ extern "rust-intrinsic" {
     ///
     /// This is not expected to ever be exposed directly to users, rather it
     /// may eventually be exposed through some more-constrained API.
-    #[cfg(not(bootstrap))]
     #[rustc_const_stable(feature = "const_transmute", since = "1.56.0")]
     #[rustc_nounwind]
     pub fn transmute_unchecked<Src, Dst>(src: Src) -> Dst;
@@ -1425,18 +1427,10 @@ extern "rust-intrinsic" {
     /// returned value will result in undefined behavior.
     ///
     /// The stabilized version of this intrinsic is [`pointer::offset`].
-    #[cfg(not(bootstrap))]
     #[must_use = "returns a new pointer rather than modifying its argument"]
     #[rustc_const_stable(feature = "const_ptr_offset", since = "1.61.0")]
     #[rustc_nounwind]
     pub fn offset<Ptr, Delta>(dst: Ptr, offset: Delta) -> Ptr;
-
-    /// The bootstrap version of this is more restricted.
-    #[cfg(bootstrap)]
-    #[must_use = "returns a new pointer rather than modifying its argument"]
-    #[rustc_const_stable(feature = "const_ptr_offset", since = "1.61.0")]
-    #[rustc_nounwind]
-    pub fn offset<T>(dst: *const T, offset: isize) -> *const T;
 
     /// Calculates the offset from a pointer, potentially wrapping.
     ///
@@ -2260,7 +2254,7 @@ extern "rust-intrinsic" {
     /// This intrinsic can *only* be called where the pointer is a local without
     /// projections (`read_via_copy(ptr)`, not `read_via_copy(*ptr)`) so that it
     /// trivially obeys runtime-MIR rules about derefs in operands.
-    #[rustc_const_stable(feature = "const_ptr_read", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_stable(feature = "const_ptr_read", since = "1.71.0")]
     #[rustc_nounwind]
     pub fn read_via_copy<T>(ptr: *const T) -> T;
 
@@ -2270,7 +2264,6 @@ extern "rust-intrinsic" {
     /// This intrinsic can *only* be called where the pointer is a local without
     /// projections (`write_via_move(ptr, x)`, not `write_via_move(*ptr, x)`) so
     /// that it trivially obeys runtime-MIR rules about derefs in operands.
-    #[cfg(not(bootstrap))]
     #[rustc_const_unstable(feature = "const_ptr_write", issue = "86302")]
     #[rustc_nounwind]
     pub fn write_via_move<T>(ptr: *mut T, value: T);
@@ -2394,6 +2387,24 @@ extern "rust-intrinsic" {
     #[rustc_const_unstable(feature = "const_intrinsic_raw_eq", issue = "none")]
     #[rustc_nounwind]
     pub fn raw_eq<T>(a: &T, b: &T) -> bool;
+
+    /// Lexicographically compare `[left, left + bytes)` and `[right, right + bytes)`
+    /// as unsigned bytes, returning negative if `left` is less, zero if all the
+    /// bytes match, or positive if `right` is greater.
+    ///
+    /// This underlies things like `<[u8]>::cmp`, and will usually lower to `memcmp`.
+    ///
+    /// # Safety
+    ///
+    /// `left` and `right` must each be [valid] for reads of `bytes` bytes.
+    ///
+    /// Note that this applies to the whole range, not just until the first byte
+    /// that differs.  That allows optimizations that can read in large chunks.
+    ///
+    /// [valid]: crate::ptr#safety
+    #[rustc_const_unstable(feature = "const_intrinsic_compare_bytes", issue = "none")]
+    #[rustc_nounwind]
+    pub fn compare_bytes(left: *const u8, right: *const u8, bytes: usize) -> i32;
 
     /// See documentation of [`std::hint::black_box`] for details.
     ///
@@ -2534,12 +2545,14 @@ pub(crate) use assert_unsafe_precondition;
 
 /// Checks whether `ptr` is properly aligned with respect to
 /// `align_of::<T>()`.
+#[inline]
 pub(crate) fn is_aligned_and_not_null<T>(ptr: *const T) -> bool {
     !ptr.is_null() && ptr.is_aligned()
 }
 
 /// Checks whether an allocation of `len` instances of `T` exceeds
 /// the maximum allowed allocation size.
+#[inline]
 pub(crate) fn is_valid_allocation_size<T>(len: usize) -> bool {
     let max_len = const {
         let size = crate::mem::size_of::<T>();
@@ -2550,13 +2563,14 @@ pub(crate) fn is_valid_allocation_size<T>(len: usize) -> bool {
 
 /// Checks whether the regions of memory starting at `src` and `dst` of size
 /// `count * size_of::<T>()` do *not* overlap.
+#[inline]
 pub(crate) fn is_nonoverlapping<T>(src: *const T, dst: *const T, count: usize) -> bool {
     let src_usize = src.addr();
     let dst_usize = dst.addr();
     let size = mem::size_of::<T>()
         .checked_mul(count)
         .expect("is_nonoverlapping: `size_of::<T>() * count` overflows a usize");
-    let diff = if src_usize > dst_usize { src_usize - dst_usize } else { dst_usize - src_usize };
+    let diff = src_usize.abs_diff(dst_usize);
     // If the absolute distance between the ptrs is at least as big as the size of the buffer,
     // they do not overlap.
     diff >= size
@@ -2650,7 +2664,7 @@ pub(crate) fn is_nonoverlapping<T>(src: *const T, dst: *const T, count: usize) -
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_allowed_through_unstable_modules]
 #[rustc_const_stable(feature = "const_intrinsic_copy", since = "1.63.0")]
-#[inline]
+#[inline(always)]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {
     extern "rust-intrinsic" {
@@ -2693,9 +2707,13 @@ pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: us
 ///
 /// Behavior is undefined if any of the following conditions are violated:
 ///
-/// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes.
+/// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes, and must remain valid even
+///   when `dst` is written for `count * size_of::<T>()` bytes. (This means if the memory ranges
+///   overlap, the two pointers must not be subject to aliasing restrictions relative to each
+///   other.)
 ///
-/// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes.
+/// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes, and must remain valid even
+///   when `src` is read for `count * size_of::<T>()` bytes.
 ///
 /// * Both `src` and `dst` must be properly aligned.
 ///
@@ -2741,7 +2759,7 @@ pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: us
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_allowed_through_unstable_modules]
 #[rustc_const_stable(feature = "const_intrinsic_copy", since = "1.63.0")]
-#[inline]
+#[inline(always)]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 pub const unsafe fn copy<T>(src: *const T, dst: *mut T, count: usize) {
     extern "rust-intrinsic" {
@@ -2814,7 +2832,7 @@ pub const unsafe fn copy<T>(src: *const T, dst: *mut T, count: usize) {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_allowed_through_unstable_modules]
 #[rustc_const_unstable(feature = "const_ptr_write", issue = "86302")]
-#[inline]
+#[inline(always)]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 pub const unsafe fn write_bytes<T>(dst: *mut T, val: u8, count: usize) {
     extern "rust-intrinsic" {
@@ -2830,26 +2848,5 @@ pub const unsafe fn write_bytes<T>(dst: *mut T, val: u8, count: usize) {
             [T](dst: *mut T) => is_aligned_and_not_null(dst)
         );
         write_bytes(dst, val, count)
-    }
-}
-
-/// Polyfill for bootstrap
-#[cfg(bootstrap)]
-pub const unsafe fn transmute_unchecked<Src, Dst>(src: Src) -> Dst {
-    use crate::mem::*;
-    // SAFETY: It's a transmute -- the caller promised it's fine.
-    unsafe { transmute_copy(&ManuallyDrop::new(src)) }
-}
-
-/// Polyfill for bootstrap
-#[cfg(bootstrap)]
-pub const unsafe fn write_via_move<T>(ptr: *mut T, value: T) {
-    use crate::mem::*;
-    // SAFETY: the caller must guarantee that `dst` is valid for writes.
-    // `dst` cannot overlap `src` because the caller has mutable access
-    // to `dst` while `src` is owned by this function.
-    unsafe {
-        copy_nonoverlapping::<T>(&value, ptr, 1);
-        forget(value);
     }
 }

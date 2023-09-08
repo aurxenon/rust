@@ -72,6 +72,9 @@ lint_builtin_incomplete_features = the feature `{$name}` is incomplete and may n
     .note = see issue #{$n} <https://github.com/rust-lang/rust/issues/{$n}> for more information
     .help = consider using `min_{$name}` instead, which is more stable and complete
 
+lint_builtin_internal_features = the feature `{$name}` is internal to the compiler or standard library
+    .note = using it is strongly discouraged
+
 lint_builtin_keyword_idents = `{$kw}` is a keyword in the {$next} edition
     .suggestion = you can use a raw identifier to stay compatible
 
@@ -127,8 +130,6 @@ lint_builtin_unexpected_cli_config_name = unexpected `{$name}` as condition name
 lint_builtin_unexpected_cli_config_value = unexpected condition value `{$value}` for condition name `{$name}`
     .help = was set with `--cfg` but isn't in the `--check-cfg` expected values
 
-lint_builtin_unnameable_test_items = cannot test inner items
-
 lint_builtin_unpermitted_type_init_label = this code causes undefined behavior when executed
 lint_builtin_unpermitted_type_init_label_suggestion = help: use `MaybeUninit<T>` instead, and only call `assume_init` after initialization is done
 
@@ -157,17 +158,20 @@ lint_builtin_while_true = denote infinite loops with `loop {"{"} ... {"}"}`
 
 lint_check_name_deprecated = lint name `{$lint_name}` is deprecated and does not have an effect anymore. Use: {$new_name}
 
+lint_check_name_removed = lint `{$lint_name}` has been removed: {$reason}
+
+lint_check_name_renamed = lint `{$lint_name}` has been renamed to `{$replace}`
+
 lint_check_name_unknown = unknown lint: `{$lint_name}`
     .help = did you mean: `{$suggestion}`
 
 lint_check_name_unknown_tool = unknown lint tool: `{$tool_name}`
 
-lint_check_name_warning = {$msg}
-
 lint_command_line_source = `forbid` lint level was set on command line
 
-lint_confusable_identifier_pair = identifier pair considered confusable between `{$existing_sym}` and `{$sym}`
-    .label = this is where the previous identifier occurred
+lint_confusable_identifier_pair = found both `{$existing_sym}` and `{$sym}` as identifiers, which look alike
+    .current_use = this identifier can be confused with `{$existing_sym}`
+    .other_use = other identifier used here
 
 lint_cstring_ptr = getting the inner pointer of a temporary `CString`
     .as_ptr_label = this pointer will be invalid
@@ -262,8 +266,6 @@ lint_improper_ctypes_char_help = consider using `u32` or `libc::wchar_t` instead
 lint_improper_ctypes_char_reason = the `char` type has no C equivalent
 lint_improper_ctypes_dyn = trait objects have no C equivalent
 
-lint_improper_ctypes_enum_phantomdata = this enum contains a PhantomData field
-
 lint_improper_ctypes_enum_repr_help =
     consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum
 
@@ -303,6 +305,27 @@ lint_improper_ctypes_union_layout_help = consider adding a `#[repr(C)]` or `#[re
 
 lint_improper_ctypes_union_layout_reason = this union has unspecified layout
 lint_improper_ctypes_union_non_exhaustive = this union is non-exhaustive
+
+# FIXME: we should ordinalize $valid_up_to when we add support for doing so
+lint_invalid_from_utf8_checked = calls to `{$method}` with a invalid literal always return an error
+    .label = the literal was valid UTF-8 up to the {$valid_up_to} bytes
+
+# FIXME: we should ordinalize $valid_up_to when we add support for doing so
+lint_invalid_from_utf8_unchecked = calls to `{$method}` with a invalid literal are undefined behavior
+    .label = the literal was valid UTF-8 up to the {$valid_up_to} bytes
+
+lint_invalid_nan_comparisons_eq_ne = incorrect NaN comparison, NaN cannot be directly compared to itself
+    .suggestion = use `f32::is_nan()` or `f64::is_nan()` instead
+
+lint_invalid_nan_comparisons_lt_le_gt_ge = incorrect NaN comparison, NaN is not orderable
+
+lint_invalid_reference_casting_assign_to_ref = assigning to `&T` is undefined behavior, consider using an `UnsafeCell`
+    .label = casting happend here
+
+lint_invalid_reference_casting_borrow_as_mut = casting `&T` to `&mut T` is undefined behavior, even if the reference is unused, consider instead using an `UnsafeCell`
+    .label = casting happend here
+
+lint_invalid_reference_casting_note_book = for more information, visit <https://doc.rust-lang.org/book/ch15-05-interior-mutability.html>
 
 lint_lintpass_by_hand = implementing `LintPass` by hand
     .help = try using `declare_lint_pass!` or `impl_lint_pass!` instead
@@ -394,8 +417,8 @@ lint_non_upper_case_global = {$sort} `{$name}` should have an upper case name
     .label = should have an UPPER_CASE name
 
 lint_noop_method_call = call to `.{$method}()` on a reference in this situation does nothing
-    .label = unnecessary method call
-    .note = the type `{$receiver_ty}` which `{$method}` is being called on is the same as the type returned from `{$method}`, so the method call does not do anything and can be removed
+    .suggestion = remove this redundant call
+    .note = the type `{$orig_ty}` does not implement `{$trait_}`, so calling `{$method}` on `&{$orig_ty}` copies the reference, which does not do anything and can be removed
 
 lint_only_cast_u8_to_char = only `u8` can be cast into `char`
     .suggestion = use a `char` literal instead
@@ -410,6 +433,7 @@ lint_overflowing_bin_hex = literal out of range for `{$ty}`
     .negative_becomes_note = and the value `-{$lit}` will become `{$actually}{$ty}`
     .positive_note = the literal `{$lit}` (decimal `{$dec}`) does not fit into the type `{$ty}` and will become `{$actually}{$ty}`
     .suggestion = consider using the type `{$suggestion_ty}` instead
+    .sign_bit_suggestion = to use as a negative number (decimal `{$negative_val}`), consider using the type `{$uint_ty}` for the literal and cast it to `{$int_ty}`
     .help = consider using the type `{$suggestion_ty}` instead
 
 lint_overflowing_int = literal out of range for `{$ty}`
@@ -433,6 +457,13 @@ lint_path_statement_drop = path statement drops value
 
 lint_path_statement_no_effect = path statement with no effect
 
+lint_ptr_null_checks_fn_ptr = function pointers are not nullable, so checking them for null will always return false
+    .help = wrap the function pointer inside an `Option` and use `Option::is_none` to check for null pointer value
+    .label = expression has type `{$orig_ty}`
+
+lint_ptr_null_checks_ref = references are not nullable, so checking them for null will always return false
+    .label = expression has type `{$orig_ty}`
+
 lint_query_instability = using `{$query}` can result in unstable query results
     .note = if you believe this case to be fine, allow this lint and add a comment explaining your rationale
 
@@ -455,21 +486,22 @@ lint_redundant_semicolons =
         *[false] this semicolon
     }
 
-lint_renamed_or_removed_lint = {$msg}
+lint_removed_lint = lint `{$name}` has been removed: {$reason}
+
+lint_renamed_lint = lint `{$name}` has been renamed to `{$replace}`
     .suggestion = use the new name
+    .help = use the new name `{$replace}`
 
 lint_requested_level = requested on the command line with `{$level} {$lint_name}`
 
 lint_supertrait_as_deref_target = `{$t}` implements `Deref` with supertrait `{$target_principal}` as target
     .label = target type is set here
 
-lint_suspicious_double_ref_op =
-    using `.{$call}()` on a double reference, which returns `{$ty}` instead of {$op ->
-        *[should_not_happen] [{$op}]
-        [deref] dereferencing
-        [borrow] borrowing
-        [clone] cloning
-    } the inner type
+lint_suspicious_double_ref_clone =
+    using `.clone()` on a double reference, which returns `{$ty}` instead of cloning the inner type
+
+lint_suspicious_double_ref_deref =
+    using `.deref()` on a double reference, which returns `{$ty}` instead of dereferencing the inner type
 
 lint_trivial_untranslatable_diag = diagnostic with static strings only
 
@@ -481,6 +513,10 @@ lint_tykind = usage of `ty::TyKind`
 
 lint_tykind_kind = usage of `ty::TyKind::<kind>`
     .suggestion = try using `ty::<kind>` directly
+
+lint_undropped_manually_drops = calls to `std::mem::drop` with `std::mem::ManuallyDrop` instead of the inner value does nothing
+    .label = argument has type `{$arg_ty}`
+    .suggestion = use `std::mem::ManuallyDrop::into_inner` to get the inner value
 
 lint_ungated_async_fn_track_caller = `#[track_caller]` on async functions is a no-op
      .label = this function will not propagate the caller location

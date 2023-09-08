@@ -472,7 +472,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         // This is fine with StackedBorrow and race checks because they don't concern metadata on
         // the *value* (including the associated provenance if this is an AtomicPtr) at this location.
         // Only metadata on the location itself is used.
-        let scalar = this.allow_data_races_ref(move |this| this.read_scalar(&place.into()))?;
+        let scalar = this.allow_data_races_ref(move |this| this.read_scalar(place))?;
         this.validate_overlapping_atomic(place)?;
         this.buffered_atomic_read(place, atomic, scalar, || {
             this.validate_atomic_load(place, atomic)
@@ -490,7 +490,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         this.atomic_access_check(dest)?;
 
         this.validate_overlapping_atomic(dest)?;
-        this.allow_data_races_mut(move |this| this.write_scalar(val, &dest.into()))?;
+        this.allow_data_races_mut(move |this| this.write_scalar(val, dest))?;
         this.validate_atomic_store(dest, atomic)?;
         // FIXME: it's not possible to get the value before write_scalar. A read_scalar will cause
         // side effects from a read the program did not perform. So we have to initialise
@@ -513,12 +513,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         this.atomic_access_check(place)?;
 
         this.validate_overlapping_atomic(place)?;
-        let old = this.allow_data_races_mut(|this| this.read_immediate(&place.into()))?;
+        let old = this.allow_data_races_mut(|this| this.read_immediate(place))?;
 
         // Atomics wrap around on overflow.
         let val = this.binary_op(op, &old, rhs)?;
         let val = if neg { this.unary_op(mir::UnOp::Not, &val)? } else { val };
-        this.allow_data_races_mut(|this| this.write_immediate(*val, &place.into()))?;
+        this.allow_data_races_mut(|this| this.write_immediate(*val, place))?;
 
         this.validate_atomic_rmw(place, atomic)?;
 
@@ -538,8 +538,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         this.atomic_access_check(place)?;
 
         this.validate_overlapping_atomic(place)?;
-        let old = this.allow_data_races_mut(|this| this.read_scalar(&place.into()))?;
-        this.allow_data_races_mut(|this| this.write_scalar(new, &place.into()))?;
+        let old = this.allow_data_races_mut(|this| this.read_scalar(place))?;
+        this.allow_data_races_mut(|this| this.write_scalar(new, place))?;
 
         this.validate_atomic_rmw(place, atomic)?;
 
@@ -560,7 +560,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         this.atomic_access_check(place)?;
 
         this.validate_overlapping_atomic(place)?;
-        let old = this.allow_data_races_mut(|this| this.read_immediate(&place.into()))?;
+        let old = this.allow_data_races_mut(|this| this.read_immediate(place))?;
         let lt = this.binary_op(mir::BinOp::Lt, &old, &rhs)?.to_scalar().to_bool()?;
 
         let new_val = if min {
@@ -569,7 +569,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
             if lt { &rhs } else { &old }
         };
 
-        this.allow_data_races_mut(|this| this.write_immediate(**new_val, &place.into()))?;
+        this.allow_data_races_mut(|this| this.write_immediate(**new_val, place))?;
 
         this.validate_atomic_rmw(place, atomic)?;
 
@@ -603,7 +603,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         // to read with the failure ordering and if successful then try again with the success
         // read ordering and write in the success case.
         // Read as immediate for the sake of `binary_op()`
-        let old = this.allow_data_races_mut(|this| this.read_immediate(&(place.into())))?;
+        let old = this.allow_data_races_mut(|this| this.read_immediate(place))?;
         // `binary_op` will bail if either of them is not a scalar.
         let eq = this.binary_op(mir::BinOp::Eq, &old, expect_old)?;
         // If the operation would succeed, but is "weak", fail some portion
@@ -621,7 +621,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         // if successful, perform a full rw-atomic validation
         // otherwise treat this as an atomic load with the fail ordering.
         if cmpxchg_success {
-            this.allow_data_races_mut(|this| this.write_scalar(new, &place.into()))?;
+            this.allow_data_races_mut(|this| this.write_scalar(new, place))?;
             this.validate_atomic_rmw(place, success)?;
             this.buffered_atomic_rmw(new, place, success, old.to_scalar())?;
         } else {
@@ -714,7 +714,8 @@ impl VClockAlloc {
                 MiriMemoryKind::Rust
                 | MiriMemoryKind::Miri
                 | MiriMemoryKind::C
-                | MiriMemoryKind::WinHeap,
+                | MiriMemoryKind::WinHeap
+                | MiriMemoryKind::Mmap,
             )
             | MemoryKind::Stack => {
                 let (alloc_index, clocks) = global.current_thread_state(thread_mgr);
@@ -1017,7 +1018,7 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         // be 8-aligned).
         let align = Align::from_bytes(place.layout.size.bytes()).unwrap();
         this.check_ptr_access_align(
-            place.ptr,
+            place.ptr(),
             place.layout.size,
             align,
             CheckInAllocMsg::MemoryAccessTest,
@@ -1030,7 +1031,7 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         // We avoid `get_ptr_alloc` since we do *not* want to run the access hooks -- the actual
         // access will happen later.
         let (alloc_id, _offset, _prov) =
-            this.ptr_try_get_alloc_id(place.ptr).expect("there are no zero-sized atomic accesses");
+            this.ptr_try_get_alloc_id(place.ptr()).expect("there are no zero-sized atomic accesses");
         if this.get_alloc_mutability(alloc_id)? == Mutability::Not {
             // FIXME: make this prettier, once these messages have separate title/span/help messages.
             throw_ub_format!(
@@ -1134,7 +1135,7 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         if let Some(data_race) = &this.machine.data_race {
             if data_race.race_detecting() {
                 let size = place.layout.size;
-                let (alloc_id, base_offset, _prov) = this.ptr_get_alloc_id(place.ptr)?;
+                let (alloc_id, base_offset, _prov) = this.ptr_get_alloc_id(place.ptr())?;
                 // Load and log the atomic operation.
                 // Note that atomic loads are possible even from read-only allocations, so `get_alloc_extra_mut` is not an option.
                 let alloc_meta = this.get_alloc_extra(alloc_id)?.data_race.as_ref().unwrap();
@@ -1142,7 +1143,7 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
                     "Atomic op({}) with ordering {:?} on {:?} (size={})",
                     description,
                     &atomic,
-                    place.ptr,
+                    place.ptr(),
                     size.bytes()
                 );
 
@@ -1185,7 +1186,7 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
                     {
                         log::trace!(
                             "Updated atomic memory({:?}, size={}) to {:#?}",
-                            place.ptr,
+                            place.ptr(),
                             size.bytes(),
                             mem_clocks.atomic_ops
                         );

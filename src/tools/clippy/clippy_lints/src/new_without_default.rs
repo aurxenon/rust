@@ -98,14 +98,14 @@ impl<'tcx> LateLintPass<'tcx> for NewWithoutDefault {
                             if name == sym::new;
                             if cx.effective_visibilities.is_reachable(impl_item.owner_id.def_id);
                             let self_def_id = cx.tcx.hir().get_parent_item(id.into());
-                            let self_ty = cx.tcx.type_of(self_def_id).subst_identity();
+                            let self_ty = cx.tcx.type_of(self_def_id).instantiate_identity();
                             if self_ty == return_ty(cx, id);
                             if let Some(default_trait_id) = cx.tcx.get_diagnostic_item(sym::Default);
                             then {
                                 if self.impling_types.is_none() {
                                     let mut impls = HirIdSet::default();
                                     cx.tcx.for_each_impl(default_trait_id, |d| {
-                                        let ty = cx.tcx.type_of(d).subst_identity();
+                                        let ty = cx.tcx.type_of(d).instantiate_identity();
                                         if let Some(ty_def) = ty.ty_adt_def() {
                                             if let Some(local_def_id) = ty_def.did().as_local() {
                                                 impls.insert(cx.tcx.hir().local_def_id_to_hir_id(local_def_id));
@@ -119,7 +119,7 @@ impl<'tcx> LateLintPass<'tcx> for NewWithoutDefault {
                                 // generics
                                 if_chain! {
                                     if let Some(ref impling_types) = self.impling_types;
-                                    let self_def = cx.tcx.type_of(self_def_id).subst_identity();
+                                    let self_def = cx.tcx.type_of(self_def_id).instantiate_identity();
                                     if let Some(self_def) = self_def.ty_adt_def();
                                     if let Some(self_local_did) = self_def.did().as_local();
                                     let self_id = cx.tcx.hir().local_def_id_to_hir_id(self_local_did);
@@ -130,6 +130,11 @@ impl<'tcx> LateLintPass<'tcx> for NewWithoutDefault {
                                 }
 
                                 let generics_sugg = snippet(cx, generics.span, "");
+                                let where_clause_sugg = if generics.has_where_clause_predicates {
+                                    format!("\n{}\n", snippet(cx, generics.where_clause_span, ""))
+                                } else {
+                                    String::new()
+                                };
                                 let self_ty_fmt = self_ty.to_string();
                                 let self_type_snip = snippet(cx, impl_self_ty.span, &self_ty_fmt);
                                 span_lint_hir_and_then(
@@ -145,8 +150,12 @@ impl<'tcx> LateLintPass<'tcx> for NewWithoutDefault {
                                             cx,
                                             item.span,
                                             "try adding this",
-                                            &create_new_without_default_suggest_msg(&self_type_snip, &generics_sugg),
-                                            Applicability::MaybeIncorrect,
+                                            &create_new_without_default_suggest_msg(
+                                                &self_type_snip,
+                                                &generics_sugg,
+                                                &where_clause_sugg
+                                            ),
+                                            Applicability::MachineApplicable,
                                         );
                                     },
                                 );
@@ -159,10 +168,14 @@ impl<'tcx> LateLintPass<'tcx> for NewWithoutDefault {
     }
 }
 
-fn create_new_without_default_suggest_msg(self_type_snip: &str, generics_sugg: &str) -> String {
+fn create_new_without_default_suggest_msg(
+    self_type_snip: &str,
+    generics_sugg: &str,
+    where_clause_sugg: &str,
+) -> String {
     #[rustfmt::skip]
     format!(
-"impl{generics_sugg} Default for {self_type_snip} {{
+"impl{generics_sugg} Default for {self_type_snip}{where_clause_sugg} {{
     fn default() -> Self {{
         Self::new()
     }}

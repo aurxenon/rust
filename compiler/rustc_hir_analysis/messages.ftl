@@ -1,6 +1,9 @@
 hir_analysis_ambiguous_lifetime_bound =
     ambiguous lifetime bound, explicit lifetime bound required
 
+hir_analysis_assoc_bound_on_const = expected associated type, found {$descr}
+    .note = trait bounds not allowed on {$descr}
+
 hir_analysis_assoc_type_binding_not_allowed =
     associated type bindings are not allowed here
     .label = associated type not allowed here
@@ -99,6 +102,15 @@ hir_analysis_invalid_union_field =
 hir_analysis_invalid_union_field_sugg =
     wrap the field type in `ManuallyDrop<...>`
 
+hir_analysis_late_bound_const_in_apit = `impl Trait` can only mention const parameters from an fn or impl
+    .label = const parameter declared here
+
+hir_analysis_late_bound_lifetime_in_apit = `impl Trait` can only mention lifetimes from an fn or impl
+    .label = lifetime declared here
+
+hir_analysis_late_bound_type_in_apit = `impl Trait` can only mention type parameters from an fn or impl
+    .label = type parameter declared here
+
 hir_analysis_lifetimes_or_bounds_mismatch_on_trait =
     lifetime parameters or bounds on {$item_kind} `{$ident}` do not match the trait declaration
     .label = lifetimes do not match {$item_kind} in trait
@@ -137,7 +149,7 @@ hir_analysis_missing_trait_item_suggestion = implement the missing item: `{$snip
 
 hir_analysis_missing_trait_item_unstable = not all trait items implemented, missing: `{$missing_item_name}`
     .note = default implementation of `{$missing_item_name}` is unstable
-    .some_note = use of unstable library feature '{$feature}': {$r}
+    .some_note = use of unstable library feature '{$feature}': {$reason}
     .none_note = use of unstable library feature '{$feature}'
 
 hir_analysis_missing_type_params =
@@ -195,6 +207,13 @@ hir_analysis_return_type_notation_conflicting_bound =
 hir_analysis_return_type_notation_equality_bound =
     return type notation is not allowed to use type equality
 
+hir_analysis_return_type_notation_illegal_param_const =
+    return type notation is not allowed for functions that have const parameters
+    .label = const parameter declared here
+hir_analysis_return_type_notation_illegal_param_type =
+    return type notation is not allowed for functions that have type parameters
+    .label = type parameter declared here
+
 hir_analysis_return_type_notation_missing_method =
     cannot find associated function `{$assoc_name}` for `{$ty_name}`
 
@@ -202,6 +221,12 @@ hir_analysis_return_type_notation_on_non_rpitit =
     return type notation used on function that is not `async` and does not return `impl Trait`
     .note = function returns `{$ty}`, which is not compatible with associated type return bounds
     .label = this function must be `async` or return `impl Trait`
+
+hir_analysis_rpitit_refined = impl trait in impl method signature does not match trait method signature
+    .suggestion = replace the return type so that it matches the trait
+    .label = return type from trait method defined here
+    .unmatched_bound_label = this bound is stronger than that defined on the trait
+    .note = add `#[allow(refining_impl_trait)]` if it is intended for this to be part of the public API of this crate
 
 hir_analysis_self_in_impl_self =
     `Self` is not valid in the self type of an impl block
@@ -231,6 +256,9 @@ hir_analysis_start_not_track_caller = `start` is not allowed to be `#[track_call
 hir_analysis_static_specialize = cannot specialize on `'static` lifetime
 
 hir_analysis_substs_on_overridden_impl = could not resolve substs on overridden impl
+
+hir_analysis_tait_forward_compat = item constrains opaque type that is not in its signature
+    .note = this item must mention the opaque type in its signature in order to be able to register hidden types
 
 hir_analysis_target_feature_on_main = `main` function is not allowed to have `#[target_feature]`
 
@@ -271,6 +299,11 @@ hir_analysis_unrecognized_atomic_operation =
 hir_analysis_unrecognized_intrinsic_function =
     unrecognized intrinsic function: `{$name}`
     .label = unrecognized intrinsic
+
+hir_analysis_unused_associated_type_bounds =
+    unnecessary associated type bound for not object safe associated type
+    .note = this associated type has a `where Self: Sized` bound. Thus, while the associated type can be specified, it cannot be used in any way, because trait objects are not `Sized`.
+    .suggestion = remove this bound
 
 hir_analysis_value_of_associated_struct_already_specified =
     the value of the associated type `{$item_name}` (from trait `{$def_path}`) is already specified

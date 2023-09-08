@@ -73,6 +73,8 @@ pub(crate) struct Context<'tcx> {
     pub(crate) include_sources: bool,
     /// Collection of all types with notable traits referenced in the current module.
     pub(crate) types_with_notable_traits: FxHashSet<clean::Type>,
+    /// Field used during rendering, to know if we're inside an inlined item.
+    pub(crate) is_inside_inlined_module: bool,
 }
 
 // `Context` is cloned a lot, so we don't want the size to grow unexpectedly.
@@ -160,7 +162,7 @@ impl<'tcx> Context<'tcx> {
         self.shared.tcx.sess
     }
 
-    pub(super) fn derive_id(&mut self, id: String) -> String {
+    pub(super) fn derive_id<S: AsRef<str> + ToString>(&mut self, id: S) -> String {
         self.id_map.derive(id)
     }
 
@@ -171,6 +173,19 @@ impl<'tcx> Context<'tcx> {
     }
 
     fn render_item(&mut self, it: &clean::Item, is_module: bool) -> String {
+        let mut render_redirect_pages = self.render_redirect_pages;
+        // If the item is stripped but inlined, links won't point to the item so no need to generate
+        // a file for it.
+        if it.is_stripped() &&
+            let Some(def_id) = it.def_id() &&
+            def_id.is_local()
+        {
+            if self.is_inside_inlined_module || self.shared.cache.inlined_items.contains(&def_id) {
+                // For now we're forced to generate a redirect page for stripped items until
+                // `record_extern_fqn` correctly points to external items.
+                render_redirect_pages = true;
+            }
+        }
         let mut title = String::new();
         if !is_module {
             title.push_str(it.name.unwrap().as_str());
@@ -191,21 +206,20 @@ impl<'tcx> Context<'tcx> {
             format!("API documentation for the Rust `{}` crate.", self.shared.layout.krate)
         } else {
             format!(
-                "API documentation for the Rust `{}` {} in crate `{}`.",
-                it.name.as_ref().unwrap(),
-                tyname,
-                self.shared.layout.krate
+                "API documentation for the Rust `{name}` {tyname} in crate `{krate}`.",
+                name = it.name.as_ref().unwrap(),
+                krate = self.shared.layout.krate,
             )
         };
         let name;
         let tyname_s = if it.is_crate() {
-            name = format!("{} crate", tyname);
+            name = format!("{tyname} crate");
             name.as_str()
         } else {
             tyname.as_str()
         };
 
-        if !self.render_redirect_pages {
+        if !render_redirect_pages {
             let clone_shared = Rc::clone(&self.shared);
             let page = layout::Page {
                 css_class: tyname_s,
@@ -249,7 +263,12 @@ impl<'tcx> Context<'tcx> {
                             current_path.push_str(&item_path(ty, names.last().unwrap().as_str()));
                             redirections.borrow_mut().insert(current_path, path);
                         }
-                        None => return layout::redirect(&format!("{}{}", self.root_path(), path)),
+                        None => {
+                            return layout::redirect(&format!(
+                                "{root}{path}",
+                                root = self.root_path()
+                            ));
+                        }
                     }
                 }
             }
@@ -367,11 +386,7 @@ impl<'tcx> Context<'tcx> {
             let hiline = span.hi(self.sess()).line;
             format!(
                 "#{}",
-                if loline == hiline {
-                    loline.to_string()
-                } else {
-                    format!("{}-{}", loline, hiline)
-                }
+                if loline == hiline { loline.to_string() } else { format!("{loline}-{hiline}") }
             )
         } else {
             "".to_string()
@@ -448,6 +463,7 @@ impl<'tcx> FormatRenderer<'tcx> for Context<'tcx> {
             generate_link_to_definition,
             call_locations,
             no_emit_shared,
+            html_no_source,
             ..
         } = options;
 
@@ -473,7 +489,7 @@ impl<'tcx> FormatRenderer<'tcx> for Context<'tcx> {
             scrape_examples_extension: !call_locations.is_empty(),
         };
         let mut issue_tracker_base_url = None;
-        let mut include_sources = true;
+        let mut include_sources = !html_no_source;
 
         // Crawl the crate attributes looking for attributes which control how we're
         // going to emit HTML
@@ -545,6 +561,7 @@ impl<'tcx> FormatRenderer<'tcx> for Context<'tcx> {
             shared: Rc::new(scx),
             include_sources,
             types_with_notable_traits: FxHashSet::default(),
+            is_inside_inlined_module: false,
         };
 
         if emit_crate {
@@ -574,6 +591,7 @@ impl<'tcx> FormatRenderer<'tcx> for Context<'tcx> {
             shared: Rc::clone(&self.shared),
             include_sources: self.include_sources,
             types_with_notable_traits: FxHashSet::default(),
+            is_inside_inlined_module: self.is_inside_inlined_module,
         }
     }
 
@@ -768,18 +786,31 @@ impl<'tcx> FormatRenderer<'tcx> for Context<'tcx> {
 
         info!("Recursing into {}", self.dst.display());
 
-        let buf = self.render_item(item, true);
-        // buf will be empty if the module is stripped and there is no redirect for it
-        if !buf.is_empty() {
-            self.shared.ensure_dir(&self.dst)?;
-            let joint_dst = self.dst.join("index.html");
-            self.shared.fs.write(joint_dst, buf)?;
+        if !item.is_stripped() {
+            let buf = self.render_item(item, true);
+            // buf will be empty if the module is stripped and there is no redirect for it
+            if !buf.is_empty() {
+                self.shared.ensure_dir(&self.dst)?;
+                let joint_dst = self.dst.join("index.html");
+                self.shared.fs.write(joint_dst, buf)?;
+            }
+        }
+        if !self.is_inside_inlined_module {
+            if let Some(def_id) = item.def_id() && self.cache().inlined_items.contains(&def_id) {
+                self.is_inside_inlined_module = true;
+            }
+        } else if !self.cache().document_hidden && item.is_doc_hidden() {
+            // We're not inside an inlined module anymore since this one cannot be re-exported.
+            self.is_inside_inlined_module = false;
         }
 
         // Render sidebar-items.js used throughout this module.
         if !self.render_redirect_pages {
-            let (clean::StrippedItem(box clean::ModuleItem(ref module)) | clean::ModuleItem(ref module)) = *item.kind
-            else { unreachable!() };
+            let (clean::StrippedItem(box clean::ModuleItem(ref module))
+            | clean::ModuleItem(ref module)) = *item.kind
+            else {
+                unreachable!()
+            };
             let items = self.build_sidebar_items(module);
             let js_dst = self.dst.join(&format!("sidebar-items{}.js", self.shared.resource_suffix));
             let v = format!("window.SIDEBAR_ITEMS = {};", serde_json::to_string(&items).unwrap());
@@ -825,12 +856,12 @@ impl<'tcx> FormatRenderer<'tcx> for Context<'tcx> {
             // If the item is a macro, redirect from the old macro URL (with !)
             // to the new one (without).
             if item_type == ItemType::Macro {
-                let redir_name = format!("{}.{}!.html", item_type, name);
+                let redir_name = format!("{item_type}.{name}!.html");
                 if let Some(ref redirections) = self.shared.redirections {
                     let crate_name = &self.shared.layout.krate;
                     redirections.borrow_mut().insert(
-                        format!("{}/{}", crate_name, redir_name),
-                        format!("{}/{}", crate_name, file_name),
+                        format!("{crate_name}/{redir_name}"),
+                        format!("{crate_name}/{file_name}"),
                     );
                 } else {
                     let v = layout::redirect(file_name);

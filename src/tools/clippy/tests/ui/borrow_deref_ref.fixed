@@ -1,4 +1,3 @@
-//@run-rustfix
 //@aux-build: proc_macros.rs
 
 #![allow(dead_code, unused_variables)]

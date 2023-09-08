@@ -7,24 +7,27 @@
 // edition: 2021
 
 #![feature(rustc_private)]
+#![feature(assert_matches)]
+#![feature(control_flow_enum)]
 
-extern crate rustc_driver;
 extern crate rustc_hir;
-extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_smir;
 
-use rustc_driver::{Callbacks, Compilation, RunCompiler};
 use rustc_hir::def::DefKind;
-use rustc_interface::{interface, Queries};
 use rustc_middle::ty::TyCtxt;
-use rustc_smir::{rustc_internal, stable_mir};
+use rustc_smir::{
+    rustc_internal,
+    stable_mir::{self, fold::Foldable},
+};
+use std::assert_matches::assert_matches;
 use std::io::Write;
+use std::ops::ControlFlow;
 
 const CRATE_NAME: &str = "input";
 
 /// This function uses the Stable MIR APIs to get information about the test crate.
-fn test_stable_mir(tcx: TyCtxt<'_>) {
+fn test_stable_mir(tcx: TyCtxt<'_>) -> ControlFlow<()> {
     // Get the local crate using stable_mir API.
     let local = stable_mir::local_crate();
     assert_eq!(&local.name, CRATE_NAME);
@@ -63,6 +66,36 @@ fn test_stable_mir(tcx: TyCtxt<'_>) {
         other => panic!("{other:?}"),
     }
 
+    let types = get_item(tcx, &items, (DefKind::Fn, "types")).unwrap();
+    let body = types.body();
+    assert_eq!(body.locals.len(), 6);
+    assert_matches!(
+        body.locals[0].kind(),
+        stable_mir::ty::TyKind::RigidTy(stable_mir::ty::RigidTy::Bool)
+    );
+    assert_matches!(
+        body.locals[1].kind(),
+        stable_mir::ty::TyKind::RigidTy(stable_mir::ty::RigidTy::Bool)
+    );
+    assert_matches!(
+        body.locals[2].kind(),
+        stable_mir::ty::TyKind::RigidTy(stable_mir::ty::RigidTy::Char)
+    );
+    assert_matches!(
+        body.locals[3].kind(),
+        stable_mir::ty::TyKind::RigidTy(stable_mir::ty::RigidTy::Int(stable_mir::ty::IntTy::I32))
+    );
+    assert_matches!(
+        body.locals[4].kind(),
+        stable_mir::ty::TyKind::RigidTy(stable_mir::ty::RigidTy::Uint(stable_mir::ty::UintTy::U64))
+    );
+    assert_matches!(
+        body.locals[5].kind(),
+        stable_mir::ty::TyKind::RigidTy(stable_mir::ty::RigidTy::Float(
+            stable_mir::ty::FloatTy::F64
+        ))
+    );
+
     let drop = get_item(tcx, &items, (DefKind::Fn, "drop")).unwrap();
     let body = drop.body();
     assert_eq!(body.blocks.len(), 2);
@@ -80,6 +113,48 @@ fn test_stable_mir(tcx: TyCtxt<'_>) {
         stable_mir::mir::Terminator::Assert { .. } => {}
         other => panic!("{other:?}"),
     }
+
+    let monomorphic = get_item(tcx, &items, (DefKind::Fn, "monomorphic")).unwrap();
+    for block in monomorphic.body().blocks {
+        match &block.terminator {
+            stable_mir::mir::Terminator::Call { func, .. } => match func {
+                stable_mir::mir::Operand::Constant(c) => match &c.literal.literal {
+                    stable_mir::ty::ConstantKind::Allocated(alloc) => {
+                        assert!(alloc.bytes.is_empty());
+                        match c.literal.ty.kind() {
+                            stable_mir::ty::TyKind::RigidTy(stable_mir::ty::RigidTy::FnDef(
+                                def,
+                                mut args,
+                            )) => {
+                                let func = def.body();
+                                match func.locals[1]
+                                    .fold(&mut args)
+                                    .continue_value()
+                                    .unwrap()
+                                    .kind()
+                                {
+                                    stable_mir::ty::TyKind::RigidTy(
+                                        stable_mir::ty::RigidTy::Uint(_),
+                                    ) => {}
+                                    stable_mir::ty::TyKind::RigidTy(
+                                        stable_mir::ty::RigidTy::Tuple(_),
+                                    ) => {}
+                                    other => panic!("{other:?}"),
+                                }
+                            }
+                            other => panic!("{other:?}"),
+                        }
+                    }
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            },
+            stable_mir::mir::Terminator::Return => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    ControlFlow::Continue(())
 }
 
 // Use internal API to find a function in a crate.
@@ -96,8 +171,8 @@ fn get_item<'a>(
 
 /// This test will generate and analyze a dummy crate using the stable mir.
 /// For that, it will first write the dummy crate into a file.
-/// It will invoke the compiler using a custom Callback implementation, which will
-/// invoke Stable MIR APIs after the compiler has finished its analysis.
+/// Then it will create a `StableMir` using custom arguments and then
+/// it will run the compiler.
 fn main() {
     let path = "input.rs";
     generate_input(&path).unwrap();
@@ -108,28 +183,7 @@ fn main() {
         CRATE_NAME.to_string(),
         path.to_string(),
     ];
-    rustc_driver::catch_fatal_errors(|| {
-        RunCompiler::new(&args, &mut SMirCalls {}).run().unwrap();
-    })
-    .unwrap();
-}
-
-struct SMirCalls {}
-
-impl Callbacks for SMirCalls {
-    /// Called after analysis. Return value instructs the compiler whether to
-    /// continue the compilation afterwards (defaults to `Compilation::Continue`)
-    fn after_analysis<'tcx>(
-        &mut self,
-        _compiler: &interface::Compiler,
-        queries: &'tcx Queries<'tcx>,
-    ) -> Compilation {
-        queries.global_ctxt().unwrap().enter(|tcx| {
-            rustc_smir::rustc_internal::run(tcx, || test_stable_mir(tcx));
-        });
-        // No need to keep going.
-        Compilation::Stop
-    }
+    rustc_internal::StableMir::new(args, test_stable_mir).run().unwrap();
 }
 
 fn generate_input(path: &str) -> std::io::Result<()> {
@@ -137,6 +191,16 @@ fn generate_input(path: &str) -> std::io::Result<()> {
     write!(
         file,
         r#"
+    fn generic<T, const U: usize>(t: T) -> [(); U] {{
+        _ = t;
+        [(); U]
+    }}
+
+    pub fn monomorphic() {{
+        generic::<(), 5>(());
+        generic::<u32, 0>(45);
+    }}
+
     mod foo {{
         pub fn bar(i: i32) -> i64 {{
             i as i64
@@ -151,6 +215,10 @@ fn generate_input(path: &str) -> std::io::Result<()> {
         let x_64 = foo::bar(x);
         let y_64 = foo::bar(y);
         x_64.wrapping_add(y_64)
+    }}
+
+    pub fn types(b: bool, _: char, _: i32, _: u64, _: f64) -> bool {{
+        b
     }}
 
     pub fn drop(_: String) {{}}

@@ -88,6 +88,7 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
             // The poll on Darwin doesn't set POLLNVAL for closed fds.
             target_os = "macos",
             target_os = "ios",
+            target_os = "tvos",
             target_os = "watchos",
             target_os = "redox",
             target_os = "l4re",
@@ -109,6 +110,11 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
             while libc::poll(pfds.as_mut_ptr(), 3, 0) == -1 {
                 match errno() {
                     libc::EINTR => continue,
+                    #[cfg(target_vendor = "unikraft")]
+                    libc::ENOSYS => {
+                        // Not all configurations of Unikraft enable `LIBPOSIX_EVENT`.
+                        break 'poll;
+                    }
                     libc::EINVAL | libc::EAGAIN | libc::ENOMEM => {
                         // RLIMIT_NOFILE or temporary allocation failures
                         // may be preventing use of poll(), fall back to fcntl
@@ -168,7 +174,9 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
             target_os = "emscripten",
             target_os = "fuchsia",
             target_os = "horizon",
-            target_os = "vita"
+            // Unikraft's `signal` implementation is currently broken:
+            // https://github.com/unikraft/lib-musl/issues/57
+            target_vendor = "unikraft",
         )))]
         {
             // We don't want to add this as a public type to std, nor do we
@@ -207,7 +215,6 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
     target_os = "emscripten",
     target_os = "fuchsia",
     target_os = "horizon",
-    target_os = "vita"
 )))]
 static UNIX_SIGPIPE_ATTR_SPECIFIED: crate::sync::atomic::AtomicBool =
     crate::sync::atomic::AtomicBool::new(false);
@@ -217,7 +224,6 @@ static UNIX_SIGPIPE_ATTR_SPECIFIED: crate::sync::atomic::AtomicBool =
     target_os = "emscripten",
     target_os = "fuchsia",
     target_os = "horizon",
-    target_os = "vita",
 )))]
 pub(crate) fn unix_sigpipe_attr_specified() -> bool {
     UNIX_SIGPIPE_ATTR_SPECIFIED.load(crate::sync::atomic::Ordering::Relaxed)
@@ -233,6 +239,11 @@ pub unsafe fn cleanup() {
 pub use crate::sys::android::signal;
 #[cfg(not(target_os = "android"))]
 pub use libc::signal;
+
+#[inline]
+pub(crate) fn is_interrupted(errno: i32) -> bool {
+    errno == libc::EINTR
+}
 
 pub fn decode_error_kind(errno: i32) -> ErrorKind {
     use ErrorKind::*;
@@ -309,7 +320,7 @@ where
 {
     loop {
         match cvt(f()) {
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(ref e) if e.is_interrupted() => {}
             other => return other,
         }
     }
@@ -395,7 +406,7 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_os = "macos")] {
         #[link(name = "System")]
         extern "C" {}
-    } else if #[cfg(any(target_os = "ios", target_os = "watchos"))] {
+    } else if #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos"))] {
         #[link(name = "System")]
         #[link(name = "objc")]
         #[link(name = "Security", kind = "framework")]
@@ -407,6 +418,9 @@ cfg_if::cfg_if! {
         extern "C" {}
     } else if #[cfg(all(target_os = "linux", target_env = "uclibc"))] {
         #[link(name = "dl")]
+        extern "C" {}
+    } else if #[cfg(target_os = "vita")] {
+        #[link(name = "pthread", kind = "static", modifiers = "-bundle")]
         extern "C" {}
     }
 }

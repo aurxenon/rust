@@ -35,6 +35,35 @@ const itemTypes = [
     "traitalias",
 ];
 
+const longItemTypes = [
+    "module",
+    "extern crate",
+    "re-export",
+    "struct",
+    "enum",
+    "function",
+    "type alias",
+    "static",
+    "trait",
+    "",
+    "trait method",
+    "method",
+    "struct field",
+    "enum variant",
+    "macro",
+    "primitive type",
+    "assoc type",
+    "constant",
+    "assoc const",
+    "union",
+    "foreign type",
+    "keyword",
+    "existential type",
+    "attribute macro",
+    "derive macro",
+    "trait alias",
+];
+
 // used for special search precedence
 const TY_PRIMITIVE = itemTypes.indexOf("primitive");
 const TY_KEYWORD = itemTypes.indexOf("keyword");
@@ -208,6 +237,45 @@ function initSearch(rawSearchIndex) {
     let typeNameIdMap;
     const ALIASES = new Map();
 
+    /**
+     * Special type name IDs for searching by array.
+     */
+    let typeNameIdOfArray;
+    /**
+     * Special type name IDs for searching by slice.
+     */
+    let typeNameIdOfSlice;
+    /**
+     * Special type name IDs for searching by both array and slice (`[]` syntax).
+     */
+    let typeNameIdOfArrayOrSlice;
+
+    /**
+     * Add an item to the type Name->ID map, or, if one already exists, use it.
+     * Returns the number. If name is "" or null, return -1 (pure generic).
+     *
+     * This is effectively string interning, so that function matching can be
+     * done more quickly. Two types with the same name but different item kinds
+     * get the same ID.
+     *
+     * @param {string} name
+     *
+     * @returns {integer}
+     */
+    function buildTypeMapIndex(name) {
+        if (name === "" || name === null) {
+            return -1;
+        }
+
+        if (typeNameIdMap.has(name)) {
+            return typeNameIdMap.get(name);
+        } else {
+            const id = typeNameIdMap.size;
+            typeNameIdMap.set(name, id);
+            return id;
+        }
+    }
+
     function isWhitespace(c) {
         return " \t\n\r".indexOf(c) !== -1;
     }
@@ -217,11 +285,11 @@ function initSearch(rawSearchIndex) {
     }
 
     function isEndCharacter(c) {
-        return ",>-".indexOf(c) !== -1;
+        return ",>-]".indexOf(c) !== -1;
     }
 
     function isStopCharacter(c) {
-        return isWhitespace(c) || isEndCharacter(c);
+        return isEndCharacter(c);
     }
 
     function isErrorCharacter(c) {
@@ -317,18 +385,69 @@ function initSearch(rawSearchIndex) {
      * @return {boolean}
      */
     function isSeparatorCharacter(c) {
-        return c === "," || isWhitespaceCharacter(c);
+        return c === ",";
     }
 
-    /**
-     * Returns `true` if the given `c` character is a whitespace.
+/**
+     * Returns `true` if the given `c` character is a path separator. For example
+     * `:` in `a::b` or a whitespace in `a b`.
      *
      * @param {string} c
      *
      * @return {boolean}
      */
-    function isWhitespaceCharacter(c) {
-        return c === " " || c === "\t";
+    function isPathSeparator(c) {
+        return c === ":" || isWhitespace(c);
+    }
+
+    /**
+     * Returns `true` if the previous character is `lookingFor`.
+     *
+     * @param {ParserState} parserState
+     * @param {String} lookingFor
+     *
+     * @return {boolean}
+     */
+    function prevIs(parserState, lookingFor) {
+        let pos = parserState.pos;
+        while (pos > 0) {
+            const c = parserState.userQuery[pos - 1];
+            if (c === lookingFor) {
+                return true;
+            } else if (!isWhitespace(c)) {
+                break;
+            }
+            pos -= 1;
+        }
+        return false;
+    }
+
+    /**
+     * Returns `true` if the last element in the `elems` argument has generics.
+     *
+     * @param {Array<QueryElement>} elems
+     * @param {ParserState} parserState
+     *
+     * @return {boolean}
+     */
+    function isLastElemGeneric(elems, parserState) {
+        return (elems.length > 0 && elems[elems.length - 1].generics.length > 0) ||
+            prevIs(parserState, ">");
+    }
+
+    /**
+     * Increase current parser position until it doesn't find a whitespace anymore.
+     *
+     * @param {ParserState} parserState
+     */
+    function skipWhitespace(parserState) {
+        while (parserState.pos < parserState.userQuery.length) {
+            const c = parserState.userQuery[parserState.pos];
+            if (!isWhitespace(c)) {
+                break;
+            }
+            parserState.pos += 1;
+        }
     }
 
     /**
@@ -340,39 +459,78 @@ function initSearch(rawSearchIndex) {
      * @return {QueryElement}                - The newly created `QueryElement`.
      */
     function createQueryElement(query, parserState, name, generics, isInGenerics) {
-        if (name === "*" || (name.length === 0 && generics.length === 0)) {
-            return;
+        const path = name.trim();
+        if (path.length === 0 && generics.length === 0) {
+            throw ["Unexpected ", parserState.userQuery[parserState.pos]];
+        } else if (path === "*") {
+            throw ["Unexpected ", "*"];
         }
         if (query.literalSearch && parserState.totalElems - parserState.genericsElems > 0) {
-            throw ["You cannot have more than one element if you use quotes"];
+            throw ["Cannot have more than one element if you use quotes"];
         }
-        const pathSegments = name.split("::");
-        if (pathSegments.length > 1) {
-            for (let i = 0, len = pathSegments.length; i < len; ++i) {
-                const pathSegment = pathSegments[i];
-
-                if (pathSegment.length === 0) {
-                    if (i === 0) {
-                        throw ["Paths cannot start with ", "::"];
-                    } else if (i + 1 === len) {
-                        throw ["Paths cannot end with ", "::"];
-                    }
-                    throw ["Unexpected ", "::::"];
-                }
+        const typeFilter = parserState.typeFilter;
+        parserState.typeFilter = null;
+        if (name === "!") {
+            if (typeFilter !== null && typeFilter !== "primitive") {
+                throw [
+                    "Invalid search type: primitive never type ",
+                    "!",
+                    " and ",
+                    typeFilter,
+                    " both specified",
+                ];
             }
+            if (generics.length !== 0) {
+                throw [
+                    "Never type ",
+                    "!",
+                    " does not accept generic parameters",
+                ];
+            }
+            return {
+                name: "never",
+                id: -1,
+                fullPath: ["never"],
+                pathWithoutLast: [],
+                pathLast: "never",
+                generics: [],
+                typeFilter: "primitive",
+            };
         }
+        if (path.startsWith("::")) {
+            throw ["Paths cannot start with ", "::"];
+        } else if (path.endsWith("::")) {
+            throw ["Paths cannot end with ", "::"];
+        } else if (path.includes("::::")) {
+            throw ["Unexpected ", "::::"];
+        } else if (path.includes(" ::")) {
+            throw ["Unexpected ", " ::"];
+        } else if (path.includes(":: ")) {
+            throw ["Unexpected ", ":: "];
+        }
+        const pathSegments = path.split(/::|\s+/);
         // In case we only have something like `<p>`, there is no name.
         if (pathSegments.length === 0 || (pathSegments.length === 1 && pathSegments[0] === "")) {
-            throw ["Found generics without a path"];
+            if (generics.length > 0 || prevIs(parserState, ">")) {
+                throw ["Found generics without a path"];
+            } else {
+                throw ["Unexpected ", parserState.userQuery[parserState.pos]];
+            }
+        }
+        for (const [i, pathSegment] of pathSegments.entries()) {
+            if (pathSegment === "!") {
+                if (i !== 0) {
+                    throw ["Never type ", "!", " is not associated item"];
+                }
+                pathSegments[i] = "never";
+            }
         }
         parserState.totalElems += 1;
         if (isInGenerics) {
             parserState.genericsElems += 1;
         }
-        const typeFilter = parserState.typeFilter;
-        parserState.typeFilter = null;
         return {
-            name: name,
+            name: name.trim(),
             id: -1,
             fullPath: pathSegments,
             pathWithoutLast: pathSegments.slice(0, pathSegments.length - 1),
@@ -408,28 +566,40 @@ function initSearch(rawSearchIndex) {
                     foundExclamation = parserState.pos;
                 } else if (isErrorCharacter(c)) {
                     throw ["Unexpected ", c];
-                } else if (
-                    isStopCharacter(c) ||
-                    isSpecialStartCharacter(c) ||
-                    isSeparatorCharacter(c)
-                ) {
-                    break;
-                } else if (c === ":") { // If we allow paths ("str::string" for example).
-                    if (!isPathStart(parserState)) {
-                        break;
+                } else if (isPathSeparator(c)) {
+                    if (c === ":") {
+                        if (!isPathStart(parserState)) {
+                            break;
+                        }
+                        // Skip current ":".
+                        parserState.pos += 1;
+                    } else {
+                        while (parserState.pos + 1 < parserState.length) {
+                            const next_c = parserState.userQuery[parserState.pos + 1];
+                            if (!isWhitespace(next_c)) {
+                                break;
+                            }
+                            parserState.pos += 1;
+                        }
                     }
                     if (foundExclamation !== -1) {
-                        if (start <= (end - 2)) {
+                        if (foundExclamation !== start &&
+                            isIdentCharacter(parserState.userQuery[foundExclamation - 1])
+                        ) {
                             throw ["Cannot have associated items in macros"];
                         } else {
-                            // if start == end - 1, we got the never type
                             // while the never type has no associated macros, we still
                             // can parse a path like that
                             foundExclamation = -1;
                         }
                     }
-                    // Skip current ":".
-                    parserState.pos += 1;
+                } else if (
+                    c === "[" ||
+                    isStopCharacter(c) ||
+                    isSpecialStartCharacter(c) ||
+                    isSeparatorCharacter(c)
+                ) {
+                    break;
                 } else {
                     throw ["Unexpected ", c];
                 }
@@ -438,7 +608,10 @@ function initSearch(rawSearchIndex) {
             end = parserState.pos;
         }
         // if start == end - 1, we got the never type
-        if (foundExclamation !== -1 && start <= (end - 2)) {
+        if (foundExclamation !== -1 &&
+            foundExclamation !== start &&
+            isIdentCharacter(parserState.userQuery[foundExclamation - 1])
+        ) {
             if (parserState.typeFilter === null) {
                 parserState.typeFilter = "macro";
             } else if (parserState.typeFilter !== "macro") {
@@ -464,37 +637,71 @@ function initSearch(rawSearchIndex) {
     function getNextElem(query, parserState, elems, isInGenerics) {
         const generics = [];
 
+        skipWhitespace(parserState);
         let start = parserState.pos;
         let end;
-        // We handle the strings on their own mostly to make code easier to follow.
-        if (parserState.userQuery[parserState.pos] === "\"") {
-            start += 1;
-            getStringElem(query, parserState, isInGenerics);
-            end = parserState.pos - 1;
-        } else {
-            end = getIdentEndPosition(parserState);
-        }
-        if (parserState.pos < parserState.length &&
-            parserState.userQuery[parserState.pos] === "<"
-        ) {
-            if (start >= end) {
-                throw ["Found generics without a path"];
-            }
+        if (parserState.userQuery[parserState.pos] === "[") {
             parserState.pos += 1;
-            getItemsBefore(query, parserState, generics, ">");
-        }
-        if (start >= end && generics.length === 0) {
-            return;
-        }
-        elems.push(
-            createQueryElement(
-                query,
-                parserState,
-                parserState.userQuery.slice(start, end),
+            getItemsBefore(query, parserState, generics, "]");
+            const typeFilter = parserState.typeFilter;
+            if (typeFilter !== null && typeFilter !== "primitive") {
+                throw [
+                    "Invalid search type: primitive ",
+                    "[]",
+                    " and ",
+                    typeFilter,
+                    " both specified",
+                ];
+            }
+            parserState.typeFilter = null;
+            parserState.totalElems += 1;
+            if (isInGenerics) {
+                parserState.genericsElems += 1;
+            }
+            elems.push({
+                name: "[]",
+                id: -1,
+                fullPath: ["[]"],
+                pathWithoutLast: [],
+                pathLast: "[]",
                 generics,
-                isInGenerics
-            )
-        );
+                typeFilter: "primitive",
+            });
+        } else {
+            const isStringElem = parserState.userQuery[start] === "\"";
+            // We handle the strings on their own mostly to make code easier to follow.
+            if (isStringElem) {
+                start += 1;
+                getStringElem(query, parserState, isInGenerics);
+                end = parserState.pos - 1;
+            } else {
+                end = getIdentEndPosition(parserState);
+            }
+            if (parserState.pos < parserState.length &&
+                parserState.userQuery[parserState.pos] === "<"
+            ) {
+                if (start >= end) {
+                    throw ["Found generics without a path"];
+                }
+                parserState.pos += 1;
+                getItemsBefore(query, parserState, generics, ">");
+            }
+            if (isStringElem) {
+                skipWhitespace(parserState);
+            }
+            if (start >= end && generics.length === 0) {
+                return;
+            }
+            elems.push(
+                createQueryElement(
+                    query,
+                    parserState,
+                    parserState.userQuery.slice(start, end),
+                    generics,
+                    isInGenerics
+                )
+            );
+        }
     }
 
     /**
@@ -518,6 +725,17 @@ function initSearch(rawSearchIndex) {
         const oldTypeFilter = parserState.typeFilter;
         parserState.typeFilter = null;
 
+        let extra = "";
+        if (endChar === ">") {
+            extra = "<";
+        } else if (endChar === "]") {
+            extra = "[";
+        } else if (endChar === "") {
+            extra = "->";
+        } else {
+            extra = endChar;
+        }
+
         while (parserState.pos < parserState.length) {
             const c = parserState.userQuery[parserState.pos];
             if (c === endChar) {
@@ -535,7 +753,7 @@ function initSearch(rawSearchIndex) {
                 if (elems.length === 0) {
                     throw ["Expected type filter before ", ":"];
                 } else if (query.literalSearch) {
-                    throw ["You cannot use quotes on type filter"];
+                    throw ["Cannot use quotes on type filter"];
                 }
                 // The type filter doesn't count as an element since it's a modifier.
                 const typeFilterElem = elems.pop();
@@ -547,43 +765,39 @@ function initSearch(rawSearchIndex) {
                 foundStopChar = true;
                 continue;
             } else if (isEndCharacter(c)) {
-                let extra = "";
-                if (endChar === ">") {
-                    extra = "<";
-                } else if (endChar === "") {
-                    extra = "->";
-                } else {
-                    extra = endChar;
-                }
                 throw ["Unexpected ", c, " after ", extra];
             }
             if (!foundStopChar) {
+                let extra = [];
+                if (isLastElemGeneric(query.elems, parserState)) {
+                    extra = [" after ", ">"];
+                } else if (prevIs(parserState, "\"")) {
+                    throw ["Cannot have more than one element if you use quotes"];
+                }
                 if (endChar !== "") {
                     throw [
                         "Expected ",
-                        ",", // comma
-                        ", ",
-                        "&nbsp;", // whitespace
+                        ",",
                         " or ",
                         endChar,
+                        ...extra,
                         ", found ",
                         c,
                     ];
                 }
                 throw [
                     "Expected ",
-                    ",", // comma
-                    " or ",
-                    "&nbsp;", // whitespace
+                    ",",
+                    ...extra,
                     ", found ",
                     c,
                 ];
             }
             const posBefore = parserState.pos;
             start = parserState.pos;
-            getNextElem(query, parserState, elems, endChar === ">");
+            getNextElem(query, parserState, elems, endChar !== "");
             if (endChar !== "" && parserState.pos >= parserState.length) {
-                throw ["Unclosed ", "<"];
+                throw ["Unclosed ", extra];
             }
             // This case can be encountered if `getNextElem` encountered a "stop character" right
             // from the start. For example if you have `,,` or `<>`. In this case, we simply move up
@@ -594,7 +808,7 @@ function initSearch(rawSearchIndex) {
             foundStopChar = false;
         }
         if (parserState.pos >= parserState.length && endChar !== "") {
-            throw ["Unclosed ", "<"];
+            throw ["Unclosed ", extra];
         }
         // We are either at the end of the string or on the `endChar` character, let's move forward
         // in any case.
@@ -610,11 +824,17 @@ function initSearch(rawSearchIndex) {
      * @param {ParserState} parserState
      */
     function checkExtraTypeFilterCharacters(start, parserState) {
-        const query = parserState.userQuery;
+        const query = parserState.userQuery.slice(start, parserState.pos).trim();
 
-        for (let pos = start; pos < parserState.pos; ++pos) {
-            if (!isIdentCharacter(query[pos]) && !isWhitespaceCharacter(query[pos])) {
-                throw ["Unexpected ", query[pos], " in type filter"];
+        for (const c in query) {
+            if (!isIdentCharacter(query[c])) {
+                throw [
+                    "Unexpected ",
+                    query[c],
+                    " in type filter (before ",
+                    ":",
+                    ")",
+                ];
             }
         }
     }
@@ -646,12 +866,17 @@ function initSearch(rawSearchIndex) {
                 throw ["Unexpected ", c];
             } else if (c === ":" && !isPathStart(parserState)) {
                 if (parserState.typeFilter !== null) {
-                    throw ["Unexpected ", ":"];
-                }
-                if (query.elems.length === 0) {
+                    throw [
+                        "Unexpected ",
+                        ":",
+                        " (expected path after type filter ",
+                        parserState.typeFilter + ":",
+                        ")",
+                    ];
+                } else if (query.elems.length === 0) {
                     throw ["Expected type filter before ", ":"];
                 } else if (query.literalSearch) {
-                    throw ["You cannot use quotes on type filter"];
+                    throw ["Cannot use quotes on type filter"];
                 }
                 // The type filter doesn't count as an element since it's a modifier.
                 const typeFilterElem = query.elems.pop();
@@ -662,29 +887,36 @@ function initSearch(rawSearchIndex) {
                 query.literalSearch = false;
                 foundStopChar = true;
                 continue;
+            } else if (isWhitespace(c)) {
+                skipWhitespace(parserState);
+                continue;
             }
             if (!foundStopChar) {
+                let extra = "";
+                if (isLastElemGeneric(query.elems, parserState)) {
+                    extra = [" after ", ">"];
+                } else if (prevIs(parserState, "\"")) {
+                    throw ["Cannot have more than one element if you use quotes"];
+                }
                 if (parserState.typeFilter !== null) {
                     throw [
                         "Expected ",
-                        ",", // comma
-                        ", ",
-                        "&nbsp;", // whitespace
+                        ",",
                         " or ",
-                        "->", // arrow
+                        "->",
+                        ...extra,
                         ", found ",
                         c,
                     ];
                 }
                 throw [
                     "Expected ",
-                    ",", // comma
+                    ",",
                     ", ",
-                    "&nbsp;", // whitespace
-                    ", ",
-                    ":", // colon
+                    ":",
                     " or ",
-                    "->", // arrow
+                    "->",
+                    ...extra,
                     ", found ",
                     c,
                 ];
@@ -699,11 +931,18 @@ function initSearch(rawSearchIndex) {
             foundStopChar = false;
         }
         if (parserState.typeFilter !== null) {
-            throw ["Unexpected ", ":", " (expected path after type filter)"];
+            throw [
+                "Unexpected ",
+                ":",
+                " (expected path after type filter ",
+                parserState.typeFilter + ":",
+                ")",
+            ];
         }
         while (parserState.pos < parserState.length) {
             if (isReturnArrow(parserState)) {
                 parserState.pos += 2;
+                skipWhitespace(parserState);
                 // Get returned elements.
                 getItemsBefore(query, parserState, query.returned, "");
                 // Nothing can come afterward!
@@ -778,9 +1017,10 @@ function initSearch(rawSearchIndex) {
      * The supported syntax by this parser is as follow:
      *
      * ident = *(ALPHA / DIGIT / "_")
-     * path = ident *(DOUBLE-COLON ident) [!]
-     * arg = [type-filter *WS COLON *WS] path [generics]
-     * type-sep = COMMA/WS *(COMMA/WS)
+     * path = ident *(DOUBLE-COLON/{WS} ident) [!]
+     * slice = OPEN-SQUARE-BRACKET [ nonempty-arg-list ] CLOSE-SQUARE-BRACKET
+     * arg = [type-filter *WS COLON *WS] (path [generics] / slice)
+     * type-sep = *WS COMMA *(COMMA)
      * nonempty-arg-list = *(type-sep) arg *(type-sep arg) *(type-sep)
      * generics = OPEN-ANGLE-BRACKET [ nonempty-arg-list ] *(type-sep)
      *            CLOSE-ANGLE-BRACKET
@@ -821,6 +1061,8 @@ function initSearch(rawSearchIndex) {
      *
      * OPEN-ANGLE-BRACKET = "<"
      * CLOSE-ANGLE-BRACKET = ">"
+     * OPEN-SQUARE-BRACKET = "["
+     * CLOSE-SQUARE-BRACKET = "]"
      * COLON = ":"
      * DOUBLE-COLON = "::"
      * QUOTE = %x22
@@ -1103,98 +1345,208 @@ function initSearch(rawSearchIndex) {
         }
 
         /**
-         * This function checks if the object (`row`) generics match the given type (`elem`)
-         * generics. If there are no generics on `row`, `defaultDistance` is returned.
+         * This function checks generics in search query `queryElem` can all be found in the
+         * search index (`fnType`),
          *
-         * @param {Row} row                 - The object to check.
-         * @param {QueryElement} elem       - The element from the parsed query.
+         * @param {FunctionType} fnType     - The object to check.
+         * @param {QueryElement} queryElem  - The element from the parsed query.
          *
-         * @return {boolean}           - Returns true if a match, false otherwise.
+         * @return {boolean} - Returns true if a match, false otherwise.
          */
-        function checkGenerics(row, elem) {
-            if (row.generics.length === 0 || elem.generics.length === 0) {
-                return false;
-            }
-            // This function is called if the names match, but we need to make
-            // sure that all generics match as well.
-            //
+        function checkGenerics(fnType, queryElem) {
+            return unifyFunctionTypes(fnType.generics, queryElem.generics);
+        }
+        /**
+         * This function checks if a list of search query `queryElems` can all be found in the
+         * search index (`fnTypes`).
+         *
+         * @param {Array<FunctionType>} fnTypes    - The objects to check.
+         * @param {Array<QueryElement>} queryElems - The elements from the parsed query.
+         *
+         * @return {boolean} - Returns true if a match, false otherwise.
+         */
+        function unifyFunctionTypes(fnTypes, queryElems) {
             // This search engine implements order-agnostic unification. There
             // should be no missing duplicates (generics have "bag semantics"),
             // and the row is allowed to have extras.
-            if (elem.generics.length > 0 && row.generics.length >= elem.generics.length) {
-                const elems = new Map();
-                const addEntryToElems = function addEntryToElems(entry) {
-                    if (entry.id === -1) {
-                        // Pure generic, needs to check into it.
-                        for (const inner_entry of entry.generics) {
-                            addEntryToElems(inner_entry);
-                        }
-                        return;
-                    }
-                    let currentEntryElems;
-                    if (elems.has(entry.id)) {
-                        currentEntryElems = elems.get(entry.id);
-                    } else {
-                        currentEntryElems = [];
-                        elems.set(entry.id, currentEntryElems);
-                    }
-                    currentEntryElems.push(entry);
-                };
-                for (const entry of row.generics) {
-                    addEntryToElems(entry);
-                }
-                // We need to find the type that matches the most to remove it in order
-                // to move forward.
-                const handleGeneric = generic => {
-                    if (!elems.has(generic.id)) {
-                        return false;
-                    }
-                    const matchElems = elems.get(generic.id);
-                    const matchIdx = matchElems.findIndex(tmp_elem => {
-                        if (generic.generics.length > 0 && !checkGenerics(tmp_elem, generic)) {
-                            return false;
-                        }
-                        return typePassesFilter(generic.typeFilter, tmp_elem.ty);
-                    });
-                    if (matchIdx === -1) {
-                        return false;
-                    }
-                    matchElems.splice(matchIdx, 1);
-                    if (matchElems.length === 0) {
-                        elems.delete(generic.id);
-                    }
-                    return true;
-                };
-                // To do the right thing with type filters, we first process generics
-                // that have them, removing matching ones from the "bag," then do the
-                // ones with no type filter, which can match any entry regardless of its
-                // own type.
-                for (const generic of elem.generics) {
-                    if (generic.typeFilter !== -1 && !handleGeneric(generic)) {
-                        return false;
-                    }
-                }
-                for (const generic of elem.generics) {
-                    if (generic.typeFilter === -1 && !handleGeneric(generic)) {
-                        return false;
-                    }
-                }
+            if (queryElems.length === 0) {
                 return true;
             }
-            return false;
+            if (!fnTypes || fnTypes.length === 0) {
+                return false;
+            }
+            /**
+             * @type Map<integer, QueryElement[]>
+             */
+            const queryElemSet = new Map();
+            const addQueryElemToQueryElemSet = queryElem => {
+                let currentQueryElemList;
+                if (queryElemSet.has(queryElem.id)) {
+                    currentQueryElemList = queryElemSet.get(queryElem.id);
+                } else {
+                    currentQueryElemList = [];
+                    queryElemSet.set(queryElem.id, currentQueryElemList);
+                }
+                currentQueryElemList.push(queryElem);
+            };
+            for (const queryElem of queryElems) {
+                addQueryElemToQueryElemSet(queryElem);
+            }
+            /**
+             * @type Map<integer, FunctionType[]>
+             */
+            const fnTypeSet = new Map();
+            const addFnTypeToFnTypeSet = fnType => {
+                // Pure generic, or an item that's not matched by any query elems.
+                // Try [unboxing] it.
+                //
+                // [unboxing]:
+                // http://ndmitchell.com/downloads/slides-hoogle_fast_type_searching-09_aug_2008.pdf
+                const queryContainsArrayOrSliceElem = queryElemSet.has(typeNameIdOfArrayOrSlice);
+                if (fnType.id === -1 || !(
+                    queryElemSet.has(fnType.id) ||
+                    (fnType.id === typeNameIdOfSlice && queryContainsArrayOrSliceElem) ||
+                    (fnType.id === typeNameIdOfArray && queryContainsArrayOrSliceElem)
+                )) {
+                    for (const innerFnType of fnType.generics) {
+                        addFnTypeToFnTypeSet(innerFnType);
+                    }
+                    return;
+                }
+                let currentQueryElemList = queryElemSet.get(fnType.id) || [];
+                let matchIdx = currentQueryElemList.findIndex(queryElem => {
+                    return typePassesFilter(queryElem.typeFilter, fnType.ty) &&
+                        checkGenerics(fnType, queryElem);
+                });
+                if (matchIdx === -1 &&
+                    (fnType.id === typeNameIdOfSlice || fnType.id === typeNameIdOfArray) &&
+                    queryContainsArrayOrSliceElem
+                ) {
+                    currentQueryElemList = queryElemSet.get(typeNameIdOfArrayOrSlice) || [];
+                    matchIdx = currentQueryElemList.findIndex(queryElem => {
+                        return typePassesFilter(queryElem.typeFilter, fnType.ty) &&
+                            checkGenerics(fnType, queryElem);
+                    });
+                }
+                // None of the query elems match the function type.
+                // Try [unboxing] it.
+                if (matchIdx === -1) {
+                    for (const innerFnType of fnType.generics) {
+                        addFnTypeToFnTypeSet(innerFnType);
+                    }
+                    return;
+                }
+                let currentFnTypeList;
+                if (fnTypeSet.has(fnType.id)) {
+                    currentFnTypeList = fnTypeSet.get(fnType.id);
+                } else {
+                    currentFnTypeList = [];
+                    fnTypeSet.set(fnType.id, currentFnTypeList);
+                }
+                currentFnTypeList.push(fnType);
+            };
+            for (const fnType of fnTypes) {
+                addFnTypeToFnTypeSet(fnType);
+            }
+            const doHandleQueryElemList = (currentFnTypeList, queryElemList) => {
+                if (queryElemList.length === 0) {
+                    return true;
+                }
+                // Multiple items in one list might match multiple items in another.
+                // Since an item with fewer generics can match an item with more, we
+                // need to check all combinations for a potential match.
+                const queryElem = queryElemList.pop();
+                const l = currentFnTypeList.length;
+                for (let i = 0; i < l; i += 1) {
+                    const fnType = currentFnTypeList[i];
+                    if (!typePassesFilter(queryElem.typeFilter, fnType.ty)) {
+                        continue;
+                    }
+                    const queryElemPathLength = queryElem.pathWithoutLast.length;
+                    // If the query element is a path (it contains `::`), we need to check if this
+                    // path is compatible with the target type.
+                    if (queryElemPathLength > 0) {
+                        const fnTypePath = fnType.path !== undefined && fnType.path !== null ?
+                            fnType.path.split("::") : [];
+                        // If the path provided in the query element is longer than this type,
+                        // no need to check it since it won't match in any case.
+                        if (queryElemPathLength > fnTypePath.length) {
+                            continue;
+                        }
+                        let i = 0;
+                        for (const path of fnTypePath) {
+                            if (path === queryElem.pathWithoutLast[i]) {
+                                i += 1;
+                                if (i >= queryElemPathLength) {
+                                    break;
+                                }
+                            }
+                        }
+                        if (i < queryElemPathLength) {
+                            // If we didn't find all parts of the path of the query element inside
+                            // the fn type, then it's not the right one.
+                            continue;
+                        }
+                    }
+                    if (queryElem.generics.length === 0 || checkGenerics(fnType, queryElem)) {
+                        currentFnTypeList.splice(i, 1);
+                        const result = doHandleQueryElemList(currentFnTypeList, queryElemList);
+                        if (result) {
+                            return true;
+                        }
+                        currentFnTypeList.splice(i, 0, fnType);
+                    }
+                }
+                return false;
+            };
+            const handleQueryElemList = (id, queryElemList) => {
+                if (!fnTypeSet.has(id)) {
+                    if (id === typeNameIdOfArrayOrSlice) {
+                        return handleQueryElemList(typeNameIdOfSlice, queryElemList) ||
+                            handleQueryElemList(typeNameIdOfArray, queryElemList);
+                    }
+                    return false;
+                }
+                const currentFnTypeList = fnTypeSet.get(id);
+                if (currentFnTypeList.length < queryElemList.length) {
+                    // It's not possible for all the query elems to find a match.
+                    return false;
+                }
+                const result = doHandleQueryElemList(currentFnTypeList, queryElemList);
+                if (result) {
+                    // Found a solution.
+                    // Any items that weren't used for it can be unboxed, and might form
+                    // part of the solution for another item.
+                    for (const innerFnType of currentFnTypeList) {
+                        addFnTypeToFnTypeSet(innerFnType);
+                    }
+                    fnTypeSet.delete(id);
+                }
+                return result;
+            };
+            let queryElemSetSize = -1;
+            while (queryElemSetSize !== queryElemSet.size) {
+                queryElemSetSize = queryElemSet.size;
+                for (const [id, queryElemList] of queryElemSet) {
+                    if (handleQueryElemList(id, queryElemList)) {
+                        queryElemSet.delete(id);
+                    }
+                }
+            }
+            return queryElemSetSize === 0;
         }
 
         /**
           * This function checks if the object (`row`) matches the given type (`elem`) and its
           * generics (if any).
           *
-          * @param {Row} row
+          * @param {Array<FunctionType>} list
           * @param {QueryElement} elem    - The element from the parsed query.
           *
           * @return {boolean} - Returns true if found, false otherwise.
           */
-        function checkIfInGenerics(row, elem) {
-            for (const entry of row.generics) {
+        function checkIfInList(list, elem) {
+            for (const entry of list) {
                 if (checkType(entry, elem)) {
                     return true;
                 }
@@ -1214,10 +1566,15 @@ function initSearch(rawSearchIndex) {
         function checkType(row, elem) {
             if (row.id === -1) {
                 // This is a pure "generic" search, no need to run other checks.
-                return row.generics.length > 0 ? checkIfInGenerics(row, elem) : false;
+                return row.generics.length > 0 ? checkIfInList(row.generics, elem) : false;
             }
 
-            if (row.id === elem.id && typePassesFilter(elem.typeFilter, row.ty)) {
+            const matchesExact = row.id === elem.id;
+            const matchesArrayOrSlice = elem.id === typeNameIdOfArrayOrSlice &&
+                (row.id === typeNameIdOfSlice || row.id === typeNameIdOfArray);
+
+            if ((matchesExact || matchesArrayOrSlice) &&
+                typePassesFilter(elem.typeFilter, row.ty)) {
                 if (elem.generics.length > 0) {
                     return checkGenerics(row, elem);
                 }
@@ -1227,59 +1584,7 @@ function initSearch(rawSearchIndex) {
             // If the current item does not match, try [unboxing] the generic.
             // [unboxing]:
             //   https://ndmitchell.com/downloads/slides-hoogle_fast_type_searching-09_aug_2008.pdf
-            return checkIfInGenerics(row, elem);
-        }
-
-        /**
-         * This function checks if the object (`row`) has an argument with the given type (`elem`).
-         *
-         * @param {Row} row
-         * @param {QueryElement} elem    - The element from the parsed query.
-         * @param {Array<integer>} skipPositions - Do not return one of these positions.
-         *
-         * @return {integer} - Returns the position of the match, or -1 if none.
-         */
-        function findArg(row, elem, skipPositions) {
-            if (row && row.type && row.type.inputs && row.type.inputs.length > 0) {
-                let i = 0;
-                for (const input of row.type.inputs) {
-                    if (skipPositions.indexOf(i) !== -1) {
-                        i += 1;
-                        continue;
-                    }
-                    if (checkType(input, elem)) {
-                        return i;
-                    }
-                    i += 1;
-                }
-            }
-            return -1;
-        }
-
-        /**
-         * This function checks if the object (`row`) returns the given type (`elem`).
-         *
-         * @param {Row} row
-         * @param {QueryElement} elem   - The element from the parsed query.
-         * @param {Array<integer>} skipPositions - Do not return one of these positions.
-         *
-         * @return {integer} - Returns the position of the matching item, or -1 if none.
-         */
-        function checkReturned(row, elem, skipPositions) {
-            if (row && row.type && row.type.output.length > 0) {
-                let i = 0;
-                for (const ret_ty of row.type.output) {
-                    if (skipPositions.indexOf(i) !== -1) {
-                        i += 1;
-                        continue;
-                    }
-                    if (checkType(ret_ty, elem)) {
-                        return i;
-                    }
-                    i += 1;
-                }
-            }
-            return -1;
+            return checkIfInList(row.generics, elem);
         }
 
         function checkPath(contains, ty, maxEditDistance) {
@@ -1480,14 +1785,14 @@ function initSearch(rawSearchIndex) {
             const fullId = row.id;
             const searchWord = searchWords[pos];
 
-            const in_args = findArg(row, elem, []);
-            if (in_args !== -1) {
+            const in_args = row.type && row.type.inputs && checkIfInList(row.type.inputs, elem);
+            if (in_args) {
                 // path_dist is 0 because no parent path information is currently stored
                 // in the search index
                 addIntoResults(results_in_args, fullId, pos, -1, 0, 0, maxEditDistance);
             }
-            const returned = checkReturned(row, elem, []);
-            if (returned !== -1) {
+            const returned = row.type && row.type.output && checkIfInList(row.type.output, elem);
+            if (returned) {
                 addIntoResults(results_returned, fullId, pos, -1, 0, 0, maxEditDistance);
             }
 
@@ -1543,32 +1848,15 @@ function initSearch(rawSearchIndex) {
          * @param {Object} results
          */
         function handleArgs(row, pos, results) {
-            if (!row || (filterCrates !== null && row.crate !== filterCrates)) {
+            if (!row || (filterCrates !== null && row.crate !== filterCrates) || !row.type) {
                 return;
             }
 
             // If the result is too "bad", we return false and it ends this search.
-            function checkArgs(elems, callback) {
-                const skipPositions = [];
-                for (const elem of elems) {
-                    // There is more than one parameter to the query so all checks should be "exact"
-                    const position = callback(
-                        row,
-                        elem,
-                        skipPositions
-                    );
-                    if (position !== -1) {
-                        skipPositions.push(position);
-                    } else {
-                        return false;
-                    }
-                }
-                return true;
-            }
-            if (!checkArgs(parsedQuery.elems, findArg)) {
+            if (!unifyFunctionTypes(row.type.inputs, parsedQuery.elems)) {
                 return;
             }
-            if (!checkArgs(parsedQuery.returned, checkReturned)) {
+            if (!unifyFunctionTypes(row.type.output, parsedQuery.returned)) {
                 return;
             }
 
@@ -1600,14 +1888,14 @@ function initSearch(rawSearchIndex) {
              * @param {QueryElement} elem
              */
             function convertNameToId(elem) {
-                if (typeNameIdMap.has(elem.name)) {
-                    elem.id = typeNameIdMap.get(elem.name);
+                if (typeNameIdMap.has(elem.pathLast)) {
+                    elem.id = typeNameIdMap.get(elem.pathLast);
                 } else if (!parsedQuery.literalSearch) {
                     let match = -1;
                     let matchDist = maxEditDistance + 1;
                     let matchName = "";
                     for (const [name, id] of typeNameIdMap) {
-                        const dist = editDistance(name, elem.name, maxEditDistance);
+                        const dist = editDistance(name, elem.pathLast, maxEditDistance);
                         if (dist <= matchDist && dist <= maxEditDistance) {
                             if (dist === matchDist && matchName > name) {
                                 continue;
@@ -1655,12 +1943,9 @@ function initSearch(rawSearchIndex) {
                     elem = parsedQuery.returned[0];
                     for (i = 0, nSearchWords = searchWords.length; i < nSearchWords; ++i) {
                         row = searchIndex[i];
-                        in_returned = checkReturned(
-                            row,
-                            elem,
-                            []
-                        );
-                        if (in_returned !== -1) {
+                        in_returned = row.type &&
+                            unifyFunctionTypes(row.type.output, parsedQuery.returned);
+                        if (in_returned) {
                             addIntoResults(
                                 results_others,
                                 row.id,
@@ -1836,15 +2121,10 @@ function initSearch(rawSearchIndex) {
             array.forEach(item => {
                 const name = item.name;
                 const type = itemTypes[item.ty];
+                const longType = longItemTypes[item.ty];
+                const typeName = longType.length !== 0 ? `${longType}` : "?";
 
                 length += 1;
-
-                let extra = "";
-                if (type === "primitive") {
-                    extra = " <i>(primitive type)</i>";
-                } else if (type === "keyword") {
-                    extra = " <i>(keyword)</i>";
-                }
 
                 const link = document.createElement("a");
                 link.className = "result-" + type;
@@ -1853,24 +2133,22 @@ function initSearch(rawSearchIndex) {
                 const resultName = document.createElement("div");
                 resultName.className = "result-name";
 
+                resultName.insertAdjacentHTML(
+                    "beforeend",
+                    `<span class="typename">${typeName}</span>`);
+                link.appendChild(resultName);
+
+                let alias = " ";
                 if (item.is_alias) {
-                    const alias = document.createElement("span");
-                    alias.className = "alias";
-
-                    const bold = document.createElement("b");
-                    bold.innerText = item.alias;
-                    alias.appendChild(bold);
-
-                    alias.insertAdjacentHTML(
-                        "beforeend",
-                        "<span class=\"grey\"><i>&nbsp;- see&nbsp;</i></span>");
-
-                    resultName.appendChild(alias);
+                    alias = ` <div class="alias">\
+<b>${item.alias}</b><i class="grey">&nbsp;- see&nbsp;</i>\
+</div>`;
                 }
                 resultName.insertAdjacentHTML(
                     "beforeend",
-                    item.displayPath + "<span class=\"" + type + "\">" + name + extra + "</span>");
-                link.appendChild(resultName);
+                    `<div class="path">${alias}\
+${item.displayPath}<span class="${type}">${name}</span>\
+</div>`);
 
                 const description = document.createElement("div");
                 description.className = "desc";
@@ -1916,6 +2194,20 @@ function initSearch(rawSearchIndex) {
         if (go_to_first || (results.others.length === 1
             && getSettingValue("go-to-only-result") === "true")
         ) {
+            // Needed to force re-execution of JS when coming back to a page. Let's take this
+            // scenario as example:
+            //
+            // 1. You have the "Directly go to item in search if there is only one result" option
+            //    enabled.
+            // 2. You make a search which results only one result, leading you automatically to
+            //    this result.
+            // 3. You go back to previous page.
+            //
+            // Now, without the call below, the JS will not be re-executed and the previous state
+            // will be used, starting search again since the search input is not empty, leading you
+            // back to the previous page again.
+            window.onunload = () => {};
+            searchState.removeQueryParameters();
             const elem = document.createElement("a");
             elem.href = results.others[0].href;
             removeClass(elem, "active");
@@ -1967,7 +2259,7 @@ function initSearch(rawSearchIndex) {
             error.forEach((value, index) => {
                 value = value.split("<").join("&lt;").split(">").join("&gt;");
                 if (index % 2 !== 0) {
-                    error[index] = `<code>${value}</code>`;
+                    error[index] = `<code>${value.replaceAll(" ", "&nbsp;")}</code>`;
                 } else {
                     error[index] = value;
                 }
@@ -2030,6 +2322,18 @@ function initSearch(rawSearchIndex) {
         printTab(currentTab);
     }
 
+    function updateSearchHistory(url) {
+        if (!browserSupportsHistoryApi()) {
+            return;
+        }
+        const params = searchState.getQueryStringParams();
+        if (!history.state && !params.search) {
+            history.pushState(null, "", url);
+        } else {
+            history.replaceState(null, "", url);
+        }
+    }
+
     /**
      * Perform a search based on the current state of the search input element
      * and display the results.
@@ -2040,7 +2344,6 @@ function initSearch(rawSearchIndex) {
         if (e) {
             e.preventDefault();
         }
-
         const query = parseQuery(searchState.input.value.trim());
         let filterCrates = getFilterCrates();
 
@@ -2066,48 +2369,12 @@ function initSearch(rawSearchIndex) {
 
         // Because searching is incremental by character, only the most
         // recent search query is added to the browser history.
-        if (browserSupportsHistoryApi()) {
-            const newURL = buildUrl(query.original, filterCrates);
-
-            if (!history.state && !params.search) {
-                history.pushState(null, "", newURL);
-            } else {
-                history.replaceState(null, "", newURL);
-            }
-        }
+        updateSearchHistory(buildUrl(query.original, filterCrates));
 
         showResults(
             execQuery(query, searchWords, filterCrates, window.currentCrate),
             params.go_to_first,
             filterCrates);
-    }
-
-    /**
-     * Add an item to the type Name->ID map, or, if one already exists, use it.
-     * Returns the number. If name is "" or null, return -1 (pure generic).
-     *
-     * This is effectively string interning, so that function matching can be
-     * done more quickly. Two types with the same name but different item kinds
-     * get the same ID.
-     *
-     * @param {Map<string, integer>} typeNameIdMap
-     * @param {string} name
-     *
-     * @returns {integer}
-     */
-    function buildTypeMapIndex(typeNameIdMap, name) {
-
-        if (name === "" || name === null) {
-            return -1;
-        }
-
-        if (typeNameIdMap.has(name)) {
-            return typeNameIdMap.get(name);
-        } else {
-            const id = typeNameIdMap.size;
-            typeNameIdMap.set(name, id);
-            return id;
-        }
     }
 
     /**
@@ -2128,7 +2395,7 @@ function initSearch(rawSearchIndex) {
      *
      * @return {Array<FunctionSearchType>}
      */
-    function buildItemSearchTypeAll(types, lowercasePaths, typeNameIdMap) {
+    function buildItemSearchTypeAll(types, lowercasePaths) {
         const PATH_INDEX_DATA = 0;
         const GENERICS_DATA = 1;
         return types.map(type => {
@@ -2140,16 +2407,23 @@ function initSearch(rawSearchIndex) {
                 pathIndex = type[PATH_INDEX_DATA];
                 generics = buildItemSearchTypeAll(
                     type[GENERICS_DATA],
-                    lowercasePaths,
-                    typeNameIdMap
+                    lowercasePaths
                 );
             }
+            // `0` is used as a sentinel because it's fewer bytes than `null`
+            if (pathIndex === 0) {
+                return {
+                    id: -1,
+                    ty: null,
+                    path: null,
+                    generics: generics,
+                };
+            }
+            const item = lowercasePaths[pathIndex - 1];
             return {
-                // `0` is used as a sentinel because it's fewer bytes than `null`
-                id: pathIndex === 0
-                    ? -1
-                    : buildTypeMapIndex(typeNameIdMap, lowercasePaths[pathIndex - 1].name),
-                ty: pathIndex === 0 ? null : lowercasePaths[pathIndex - 1].ty,
+                id: buildTypeMapIndex(item.name),
+                ty: item.ty,
+                path: item.path,
                 generics: generics,
             };
         });
@@ -2171,7 +2445,7 @@ function initSearch(rawSearchIndex) {
      *
      * @return {null|FunctionSearchType}
      */
-    function buildFunctionSearchType(functionSearchType, lowercasePaths, typeNameIdMap) {
+    function buildFunctionSearchType(functionSearchType, lowercasePaths) {
         const INPUTS_DATA = 0;
         const OUTPUT_DATA = 1;
         // `0` is used as a sentinel because it's fewer bytes than `null`
@@ -2181,35 +2455,51 @@ function initSearch(rawSearchIndex) {
         let inputs, output;
         if (typeof functionSearchType[INPUTS_DATA] === "number") {
             const pathIndex = functionSearchType[INPUTS_DATA];
-            inputs = [{
-                id: pathIndex === 0
-                    ? -1
-                    : buildTypeMapIndex(typeNameIdMap, lowercasePaths[pathIndex - 1].name),
-                ty: pathIndex === 0 ? null : lowercasePaths[pathIndex - 1].ty,
-                generics: [],
-            }];
+            if (pathIndex === 0) {
+                inputs = [{
+                    id: -1,
+                    ty: null,
+                    path: null,
+                    generics: [],
+                }];
+            } else {
+                const item = lowercasePaths[pathIndex - 1];
+                inputs = [{
+                    id: buildTypeMapIndex(item.name),
+                    ty: item.ty,
+                    path: item.path,
+                    generics: [],
+                }];
+            }
         } else {
             inputs = buildItemSearchTypeAll(
                 functionSearchType[INPUTS_DATA],
-                lowercasePaths,
-                typeNameIdMap
+                lowercasePaths
             );
         }
         if (functionSearchType.length > 1) {
             if (typeof functionSearchType[OUTPUT_DATA] === "number") {
                 const pathIndex = functionSearchType[OUTPUT_DATA];
-                output = [{
-                    id: pathIndex === 0
-                        ? -1
-                        : buildTypeMapIndex(typeNameIdMap, lowercasePaths[pathIndex - 1].name),
-                    ty: pathIndex === 0 ? null : lowercasePaths[pathIndex - 1].ty,
-                    generics: [],
-                }];
+                if (pathIndex === 0) {
+                    output = [{
+                        id: -1,
+                        ty: null,
+                        path: null,
+                        generics: [],
+                    }];
+                } else {
+                    const item = lowercasePaths[pathIndex - 1];
+                    output = [{
+                        id: buildTypeMapIndex(item.name),
+                        ty: item.ty,
+                        path: item.path,
+                        generics: [],
+                    }];
+                }
             } else {
                 output = buildItemSearchTypeAll(
                     functionSearchType[OUTPUT_DATA],
-                    lowercasePaths,
-                    typeNameIdMap
+                    lowercasePaths
                 );
             }
         } else {
@@ -2233,6 +2523,12 @@ function initSearch(rawSearchIndex) {
         let currentIndex = 0;
         let id = 0;
 
+        // Initialize type map indexes for primitive list types
+        // that can be searched using `[]` syntax.
+        typeNameIdOfArray = buildTypeMapIndex("array");
+        typeNameIdOfSlice = buildTypeMapIndex("slice");
+        typeNameIdOfArrayOrSlice = buildTypeMapIndex("[]");
+
         for (const crate in rawSearchIndex) {
             if (!hasOwnPropertyRustdoc(rawSearchIndex, crate)) {
                 continue;
@@ -2241,18 +2537,25 @@ function initSearch(rawSearchIndex) {
             let crateSize = 0;
 
             /**
-             * The raw search data for a given crate. `n`, `t`, `d`, and `q`, `i`, and `f`
-             * are arrays with the same length. n[i] contains the name of an item.
-             * t[i] contains the type of that item (as a string of characters that represent an
-             * offset in `itemTypes`). d[i] contains the description of that item.
+             * The raw search data for a given crate. `n`, `t`, `d`, `i`, and `f`
+             * are arrays with the same length. `q`, `a`, and `c` use a sparse
+             * representation for compactness.
              *
-             * q[i] contains the full path of the item, or an empty string indicating
-             * "same as q[i-1]".
+             * `n[i]` contains the name of an item.
              *
-             * i[i] contains an item's parent, usually a module. For compactness,
+             * `t[i]` contains the type of that item
+             * (as a string of characters that represent an offset in `itemTypes`).
+             *
+             * `d[i]` contains the description of that item.
+             *
+             * `q` contains the full paths of the items. For compactness, it is a set of
+             * (index, path) pairs used to create a map. If a given index `i` is
+             * not present, this indicates "same as the last index present".
+             *
+             * `i[i]` contains an item's parent, usually a module. For compactness,
              * it is a set of indexes into the `p` array.
              *
-             * f[i] contains function signatures, or `0` if the item isn't a function.
+             * `f[i]` contains function signatures, or `0` if the item isn't a function.
              * Functions are themselves encoded as arrays. The first item is a list of
              * types representing the function's inputs, and the second list item is a list
              * of types representing the function's output. Tuples are flattened.
@@ -2265,6 +2568,8 @@ function initSearch(rawSearchIndex) {
              * `doc` contains the description of the crate.
              *
              * `p` is a list of path/type pairs. It is used for parents and function parameters.
+             *
+             * `c` is an array of item indices that are deprecated.
              *
              * @type {{
              *   doc: string,
@@ -2332,9 +2637,19 @@ function initSearch(rawSearchIndex) {
             // convert `rawPaths` entries into object form
             // generate normalizedPaths for function search mode
             let len = paths.length;
+            let lastPath = itemPaths.get(0);
             for (let i = 0; i < len; ++i) {
-                lowercasePaths.push({ty: paths[i][0], name: paths[i][1].toLowerCase()});
-                paths[i] = {ty: paths[i][0], name: paths[i][1]};
+                const elem = paths[i];
+                const ty = elem[0];
+                const name = elem[1];
+                let path = null;
+                if (elem.length > 2) {
+                    path = itemPaths.has(elem[2]) ? itemPaths.get(elem[2]) : lastPath;
+                    lastPath = path;
+                }
+
+                lowercasePaths.push({ty: ty, name: name.toLowerCase(), path: path});
+                paths[i] = {ty: ty, name: name, path: path};
             }
 
             // convert `item*` into an object form, and construct word indices.
@@ -2344,8 +2659,8 @@ function initSearch(rawSearchIndex) {
             // operation that is cached for the life of the page state so that
             // all other search operations have access to this cached data for
             // faster analysis operations
+            lastPath = "";
             len = itemTypes.length;
-            let lastPath = "";
             for (let i = 0; i < len; ++i) {
                 let word = "";
                 // This object should have exactly the same set of fields as the "crateRow"
@@ -2354,17 +2669,17 @@ function initSearch(rawSearchIndex) {
                     word = itemNames[i].toLowerCase();
                 }
                 searchWords.push(word);
+                const path = itemPaths.has(i) ? itemPaths.get(i) : lastPath;
                 const row = {
                     crate: crate,
                     ty: itemTypes.charCodeAt(i) - charA,
                     name: itemNames[i],
-                    path: itemPaths.has(i) ? itemPaths.get(i) : lastPath,
+                    path: path,
                     desc: itemDescs[i],
                     parent: itemParentIdxs[i] > 0 ? paths[itemParentIdxs[i] - 1] : undefined,
                     type: buildFunctionSearchType(
                         itemFunctionSearchTypes[i],
-                        lowercasePaths,
-                        typeNameIdMap
+                        lowercasePaths
                     ),
                     id: id,
                     normalizedName: word.indexOf("_") === -1 ? word : word.replace(/_/g, ""),
@@ -2566,13 +2881,8 @@ function initSearch(rawSearchIndex) {
     function updateCrate(ev) {
         if (ev.target.value === "all crates") {
             // If we don't remove it from the URL, it'll be picked up again by the search.
-            const params = searchState.getQueryStringParams();
             const query = searchState.input.value.trim();
-            if (!history.state && !params.search) {
-                history.pushState(null, "", buildUrl(query, null));
-            } else {
-                history.replaceState(null, "", buildUrl(query, null));
-            }
+            updateSearchHistory(buildUrl(query, null));
         }
         // In case you "cut" the entry from the search input, then change the crate filter
         // before paste back the previous search, you get the old search results without

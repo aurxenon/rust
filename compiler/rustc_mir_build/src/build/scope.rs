@@ -90,7 +90,8 @@ use rustc_index::{IndexSlice, IndexVec};
 use rustc_middle::middle::region;
 use rustc_middle::mir::*;
 use rustc_middle::thir::{Expr, LintLevel};
-
+use rustc_middle::ty::Ty;
+use rustc_session::lint::Level;
 use rustc_span::{Span, DUMMY_SP};
 
 #[derive(Debug)]
@@ -369,7 +370,7 @@ impl DropTree {
                     let terminator = TerminatorKind::Drop {
                         target: blocks[drop_data.1].unwrap(),
                         // The caller will handle this if needed.
-                        unwind: UnwindAction::Terminate,
+                        unwind: UnwindAction::Terminate(UnwindTerminateReason::InCleanup),
                         place: drop_data.0.local.into(),
                         replace: false,
                     };
@@ -684,9 +685,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         drops.add_entry(block, drop_idx);
 
         // `build_drop_trees` doesn't have access to our source_info, so we
-        // create a dummy terminator now. `TerminatorKind::Resume` is used
+        // create a dummy terminator now. `TerminatorKind::UnwindResume` is used
         // because MIR type checking will panic if it hasn't been overwritten.
-        self.cfg.terminate(block, source_info, TerminatorKind::Resume);
+        self.cfg.terminate(block, source_info, TerminatorKind::UnwindResume);
 
         self.cfg.start_new_block().unit()
     }
@@ -716,15 +717,15 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         drops.add_entry(block, drop_idx);
 
         // `build_drop_trees` doesn't have access to our source_info, so we
-        // create a dummy terminator now. `TerminatorKind::Resume` is used
+        // create a dummy terminator now. `TerminatorKind::UnwindResume` is used
         // because MIR type checking will panic if it hasn't been overwritten.
-        self.cfg.terminate(block, source_info, TerminatorKind::Resume);
+        self.cfg.terminate(block, source_info, TerminatorKind::UnwindResume);
     }
 
     // Add a dummy `Assign` statement to the CFG, with the span for the source code's `continue`
     // statement.
     fn add_dummy_assignment(&mut self, span: Span, block: BasicBlock, source_info: SourceInfo) {
-        let local_decl = LocalDecl::new(self.tcx.mk_unit(), span).internal();
+        let local_decl = LocalDecl::new(Ty::new_unit(self.tcx), span).internal();
         let temp_place = Place::from(self.local_decls.push(local_decl));
         self.cfg.push_assign_unit(block, source_info, temp_place, self.tcx);
     }
@@ -759,20 +760,25 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     ) {
         let (current_root, parent_root) =
             if self.tcx.sess.opts.unstable_opts.maximal_hir_to_mir_coverage {
-                // Some consumers of rustc need to map MIR locations back to HIR nodes. Currently the
-                // the only part of rustc that tracks MIR -> HIR is the `SourceScopeLocalData::lint_root`
-                // field that tracks lint levels for MIR locations. Normally the number of source scopes
-                // is limited to the set of nodes with lint annotations. The -Zmaximal-hir-to-mir-coverage
-                // flag changes this behavior to maximize the number of source scopes, increasing the
-                // granularity of the MIR->HIR mapping.
+                // Some consumers of rustc need to map MIR locations back to HIR nodes. Currently
+                // the the only part of rustc that tracks MIR -> HIR is the
+                // `SourceScopeLocalData::lint_root` field that tracks lint levels for MIR
+                // locations. Normally the number of source scopes is limited to the set of nodes
+                // with lint annotations. The -Zmaximal-hir-to-mir-coverage flag changes this
+                // behavior to maximize the number of source scopes, increasing the granularity of
+                // the MIR->HIR mapping.
                 (current_id, parent_id)
             } else {
-                // Use `maybe_lint_level_root_bounded` with `self.hir_id` as a bound
-                // to avoid adding Hir dependencies on our parents.
-                // We estimate the true lint roots here to avoid creating a lot of source scopes.
+                // Use `maybe_lint_level_root_bounded` to avoid adding Hir dependencies on our
+                // parents. We estimate the true lint roots here to avoid creating a lot of source
+                // scopes.
                 (
-                    self.tcx.maybe_lint_level_root_bounded(current_id, self.hir_id),
-                    self.tcx.maybe_lint_level_root_bounded(parent_id, self.hir_id),
+                    self.maybe_lint_level_root_bounded(current_id),
+                    if parent_id == self.hir_id {
+                        parent_id // this is very common
+                    } else {
+                        self.maybe_lint_level_root_bounded(parent_id)
+                    },
                 )
             };
 
@@ -780,6 +786,50 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             let lint_level = LintLevel::Explicit(current_root);
             self.source_scope = self.new_source_scope(span, lint_level, safety);
         }
+    }
+
+    /// Walks upwards from `orig_id` to find a node which might change lint levels with attributes.
+    /// It stops at `self.hir_id` and just returns it if reached.
+    fn maybe_lint_level_root_bounded(&mut self, orig_id: HirId) -> HirId {
+        // This assertion lets us just store `ItemLocalId` in the cache, rather
+        // than the full `HirId`.
+        assert_eq!(orig_id.owner, self.hir_id.owner);
+
+        let mut id = orig_id;
+        let hir = self.tcx.hir();
+        loop {
+            if id == self.hir_id {
+                // This is a moderately common case, mostly hit for previously unseen nodes.
+                break;
+            }
+
+            if hir.attrs(id).iter().any(|attr| Level::from_attr(attr).is_some()) {
+                // This is a rare case. It's for a node path that doesn't reach the root due to an
+                // intervening lint level attribute. This result doesn't get cached.
+                return id;
+            }
+
+            let next = hir.parent_id(id);
+            if next == id {
+                bug!("lint traversal reached the root of the crate");
+            }
+            id = next;
+
+            // This lookup is just an optimization; it can be removed without affecting
+            // functionality. It might seem strange to see this at the end of this loop, but the
+            // `orig_id` passed in to this function is almost always previously unseen, for which a
+            // lookup will be a miss. So we only do lookups for nodes up the parent chain, where
+            // cache lookups have a very high hit rate.
+            if self.lint_level_roots_cache.contains(id.local_id) {
+                break;
+            }
+        }
+
+        // `orig_id` traced to `self_id`; record this fact. If `orig_id` is a leaf node it will
+        // rarely (never?) subsequently be searched for, but it's hard to know if that is the case.
+        // The performance wins from the cache all come from caching non-leaf nodes.
+        self.lint_level_roots_cache.insert(orig_id.local_id);
+        self.hir_id
     }
 
     /// Creates a new source scope, nested in the current one.
@@ -1391,7 +1441,7 @@ impl<'a, 'tcx: 'a> Builder<'a, 'tcx> {
         blocks[ROOT_NODE] = *resume_block;
         drops.build_mir::<Unwind>(cfg, &mut blocks);
         if let (None, Some(resume)) = (*resume_block, blocks[ROOT_NODE]) {
-            cfg.terminate(resume, SourceInfo::outermost(fn_span), TerminatorKind::Resume);
+            cfg.terminate(resume, SourceInfo::outermost(fn_span), TerminatorKind::UnwindResume);
 
             *resume_block = blocks[ROOT_NODE];
         }
@@ -1456,8 +1506,8 @@ impl<'tcx> DropTreeBuilder<'tcx> for Unwind {
             }
             TerminatorKind::Goto { .. }
             | TerminatorKind::SwitchInt { .. }
-            | TerminatorKind::Resume
-            | TerminatorKind::Terminate
+            | TerminatorKind::UnwindResume
+            | TerminatorKind::UnwindTerminate(_)
             | TerminatorKind::Return
             | TerminatorKind::Unreachable
             | TerminatorKind::Yield { .. }

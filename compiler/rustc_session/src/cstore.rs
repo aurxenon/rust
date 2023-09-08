@@ -7,12 +7,13 @@ use crate::utils::NativeLibKind;
 use crate::Session;
 use rustc_ast as ast;
 use rustc_data_structures::owned_slice::OwnedSlice;
-use rustc_data_structures::sync::{self, AppendOnlyIndexVec, RwLock};
+use rustc_data_structures::sync::{self, AppendOnlyIndexVec, FreezeLock, RwLock};
 use rustc_hir::def_id::{CrateNum, DefId, LocalDefId, StableCrateId, LOCAL_CRATE};
 use rustc_hir::definitions::{DefKey, DefPath, DefPathHash, Definitions};
 use rustc_span::hygiene::{ExpnHash, ExpnId};
 use rustc_span::symbol::Symbol;
 use rustc_span::Span;
+use rustc_target::spec::abi::Abi;
 use rustc_target::spec::Target;
 
 use std::any::Any;
@@ -147,6 +148,7 @@ pub enum DllCallingConvention {
 pub struct ForeignModule {
     pub foreign_items: Vec<DefId>,
     pub def_id: DefId,
+    pub abi: Abi,
 }
 
 #[derive(Copy, Clone, Debug, HashStable_Generic)]
@@ -259,5 +261,5 @@ pub struct Untracked {
     pub cstore: RwLock<Box<CrateStoreDyn>>,
     /// Reference span for definitions.
     pub source_span: AppendOnlyIndexVec<LocalDefId, Span>,
-    pub definitions: RwLock<Definitions>,
+    pub definitions: FreezeLock<Definitions>,
 }

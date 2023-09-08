@@ -267,6 +267,25 @@ pub struct DocInlineOnlyUse {
     pub item_span: Option<Span>,
 }
 
+#[derive(LintDiagnostic)]
+#[diag(passes_doc_masked_only_extern_crate)]
+#[note]
+pub struct DocMaskedOnlyExternCrate {
+    #[label]
+    pub attr_span: Span,
+    #[label(passes_not_an_extern_crate_label)]
+    pub item_span: Option<Span>,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(passes_doc_masked_not_extern_crate_self)]
+pub struct DocMaskedNotExternCrateSelf {
+    #[label]
+    pub attr_span: Span,
+    #[label(passes_extern_crate_self_label)]
+    pub item_span: Option<Span>,
+}
+
 #[derive(Diagnostic)]
 #[diag(passes_doc_attr_not_crate_level)]
 pub struct DocAttrNotCrateLevel<'a> {
@@ -280,6 +299,10 @@ pub struct DocAttrNotCrateLevel<'a> {
 pub struct DocTestUnknown {
     pub path: String,
 }
+
+#[derive(LintDiagnostic)]
+#[diag(passes_doc_test_literal)]
+pub struct DocTestLiteral;
 
 #[derive(LintDiagnostic)]
 #[diag(passes_doc_test_takes_list)]
@@ -607,17 +630,42 @@ pub struct RustcStdInternalSymbol {
 }
 
 #[derive(Diagnostic)]
-#[diag(passes_const_trait)]
-pub struct ConstTrait {
+#[diag(passes_link_ordinal)]
+pub struct LinkOrdinal {
     #[primary_span]
     pub attr_span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(passes_link_ordinal)]
-pub struct LinkOrdinal {
+#[diag(passes_confusables)]
+pub struct Confusables {
     #[primary_span]
     pub attr_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(passes_empty_confusables)]
+pub(crate) struct EmptyConfusables {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(passes_incorrect_meta_item, code = "E0539")]
+pub(crate) struct IncorrectMetaItem {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub suggestion: IncorrectMetaItemSuggestion,
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion(passes_incorrect_meta_item_suggestion, applicability = "maybe-incorrect")]
+pub(crate) struct IncorrectMetaItemSuggestion {
+    #[suggestion_part(code = "\"")]
+    pub lo: Span,
+    #[suggestion_part(code = "\"")]
+    pub hi: Span,
 }
 
 #[derive(Diagnostic)]
@@ -641,6 +689,10 @@ pub struct MacroUse {
 pub enum MacroExport {
     #[diag(passes_macro_export)]
     Normal,
+
+    #[diag(passes_macro_export_on_decl_macro)]
+    #[note]
+    OnDeclMacro,
 
     #[diag(passes_invalid_macro_export_arguments)]
     UnknownItem { name: Symbol },
@@ -821,32 +873,32 @@ pub struct DuplicateDiagnosticItemInCrate {
 }
 
 #[derive(Diagnostic)]
-#[diag(passes_abi)]
-pub struct Abi {
+#[diag(passes_layout_abi)]
+pub struct LayoutAbi {
     #[primary_span]
     pub span: Span,
     pub abi: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(passes_align)]
-pub struct Align {
+#[diag(passes_layout_align)]
+pub struct LayoutAlign {
     #[primary_span]
     pub span: Span,
     pub align: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(passes_size)]
-pub struct Size {
+#[diag(passes_layout_size)]
+pub struct LayoutSize {
     #[primary_span]
     pub span: Span,
     pub size: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(passes_homogeneous_aggregate)]
-pub struct HomogeneousAggregate {
+#[diag(passes_layout_homogeneous_aggregate)]
+pub struct LayoutHomogeneousAggregate {
     #[primary_span]
     pub span: Span,
     pub homogeneous_aggregate: String,
@@ -859,6 +911,38 @@ pub struct LayoutOf {
     pub span: Span,
     pub normalized_ty: String,
     pub ty_layout: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(passes_layout_invalid_attribute)]
+pub struct LayoutInvalidAttribute {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(passes_abi_of)]
+pub struct AbiOf {
+    #[primary_span]
+    pub span: Span,
+    pub fn_name: Symbol,
+    pub fn_abi: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(passes_abi_ne)]
+pub struct AbiNe {
+    #[primary_span]
+    pub span: Span,
+    pub left: String,
+    pub right: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(passes_abi_invalid_attribute)]
+pub struct AbiInvalidAttribute {
+    #[primary_span]
+    pub span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -1151,14 +1235,6 @@ pub struct ExternMain {
 pub struct UnixSigpipeValues {
     #[primary_span]
     pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag(passes_no_main_function, code = "E0601")]
-pub struct NoMainFunction {
-    #[primary_span]
-    pub span: Span,
-    pub crate_name: String,
 }
 
 pub struct NoMainErr {

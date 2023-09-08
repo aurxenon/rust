@@ -214,6 +214,9 @@ mir_build_mutation_of_layout_constrained_field_requires_unsafe_unsafe_op_in_unsa
 
 mir_build_non_const_path = runtime values cannot be referenced in patterns
 
+mir_build_non_exhaustive_match_all_arms_guarded =
+    match arms with guards don't count towards exhaustivity
+
 mir_build_non_exhaustive_omitted_pattern = some variants are not matched explicitly
     .help = ensure that all variants are matched explicitly by adding the suggested match arms
     .note = the matched value is of type `{$scrut_ty}` and the `non_exhaustive_omitted_patterns` attribute was found
@@ -308,6 +311,8 @@ mir_build_union_pattern = cannot use unions in constant patterns
 mir_build_unreachable_pattern = unreachable pattern
     .label = unreachable pattern
     .catchall_label = matches any value
+
+mir_build_unsafe_not_inherited = items do not inherit unsafety from separate enclosing items
 
 mir_build_unsafe_op_in_unsafe_fn_borrow_of_layout_constrained_field_requires_unsafe =
     borrow of layout constrained field with interior mutability is unsafe and requires unsafe block (error E0133)

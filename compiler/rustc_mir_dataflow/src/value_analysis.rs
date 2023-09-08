@@ -47,8 +47,7 @@ use rustc_target::abi::{FieldIdx, VariantIdx};
 
 use crate::lattice::{HasBottom, HasTop};
 use crate::{
-    fmt::DebugWithContext, Analysis, AnalysisDomain, CallReturnPlaces, JoinSemiLattice,
-    SwitchIntEdgeEffects,
+    fmt::DebugWithContext, Analysis, AnalysisDomain, JoinSemiLattice, SwitchIntEdgeEffects,
 };
 
 pub trait ValueAnalysis<'tcx> {
@@ -242,11 +241,19 @@ pub trait ValueAnalysis<'tcx> {
 
     /// The effect of a successful function call return should not be
     /// applied here, see [`Analysis::apply_terminator_effect`].
-    fn handle_terminator(&self, terminator: &Terminator<'tcx>, state: &mut State<Self::Value>) {
+    fn handle_terminator<'mir>(
+        &self,
+        terminator: &'mir Terminator<'tcx>,
+        state: &mut State<Self::Value>,
+    ) -> TerminatorEdges<'mir, 'tcx> {
         self.super_terminator(terminator, state)
     }
 
-    fn super_terminator(&self, terminator: &Terminator<'tcx>, state: &mut State<Self::Value>) {
+    fn super_terminator<'mir>(
+        &self,
+        terminator: &'mir Terminator<'tcx>,
+        state: &mut State<Self::Value>,
+    ) -> TerminatorEdges<'mir, 'tcx> {
         match &terminator.kind {
             TerminatorKind::Call { .. } | TerminatorKind::InlineAsm { .. } => {
                 // Effect is applied by `handle_call_return`.
@@ -258,10 +265,12 @@ pub trait ValueAnalysis<'tcx> {
                 // They would have an effect, but are not allowed in this phase.
                 bug!("encountered disallowed terminator");
             }
+            TerminatorKind::SwitchInt { discr, targets } => {
+                return self.handle_switch_int(discr, targets, state);
+            }
             TerminatorKind::Goto { .. }
-            | TerminatorKind::SwitchInt { .. }
-            | TerminatorKind::Resume
-            | TerminatorKind::Terminate
+            | TerminatorKind::UnwindResume
+            | TerminatorKind::UnwindTerminate(_)
             | TerminatorKind::Return
             | TerminatorKind::Unreachable
             | TerminatorKind::Assert { .. }
@@ -271,6 +280,7 @@ pub trait ValueAnalysis<'tcx> {
                 // These terminators have no effect on the analysis.
             }
         }
+        terminator.edges()
     }
 
     fn handle_call_return(
@@ -291,19 +301,22 @@ pub trait ValueAnalysis<'tcx> {
         })
     }
 
-    fn handle_switch_int(
+    fn handle_switch_int<'mir>(
         &self,
-        discr: &Operand<'tcx>,
-        apply_edge_effects: &mut impl SwitchIntEdgeEffects<State<Self::Value>>,
-    ) {
-        self.super_switch_int(discr, apply_edge_effects)
+        discr: &'mir Operand<'tcx>,
+        targets: &'mir SwitchTargets,
+        state: &mut State<Self::Value>,
+    ) -> TerminatorEdges<'mir, 'tcx> {
+        self.super_switch_int(discr, targets, state)
     }
 
-    fn super_switch_int(
+    fn super_switch_int<'mir>(
         &self,
-        _discr: &Operand<'tcx>,
-        _apply_edge_effects: &mut impl SwitchIntEdgeEffects<State<Self::Value>>,
-    ) {
+        discr: &'mir Operand<'tcx>,
+        targets: &'mir SwitchTargets,
+        _state: &mut State<Self::Value>,
+    ) -> TerminatorEdges<'mir, 'tcx> {
+        TerminatorEdges::SwitchInt { discr, targets }
     }
 
     fn wrap(self) -> ValueAnalysisWrapper<Self>
@@ -343,7 +356,7 @@ where
     T: ValueAnalysis<'tcx>,
 {
     fn apply_statement_effect(
-        &self,
+        &mut self,
         state: &mut Self::Domain,
         statement: &Statement<'tcx>,
         _location: Location,
@@ -353,22 +366,24 @@ where
         }
     }
 
-    fn apply_terminator_effect(
-        &self,
+    fn apply_terminator_effect<'mir>(
+        &mut self,
         state: &mut Self::Domain,
-        terminator: &Terminator<'tcx>,
+        terminator: &'mir Terminator<'tcx>,
         _location: Location,
-    ) {
+    ) -> TerminatorEdges<'mir, 'tcx> {
         if state.is_reachable() {
-            self.0.handle_terminator(terminator, state);
+            self.0.handle_terminator(terminator, state)
+        } else {
+            TerminatorEdges::None
         }
     }
 
     fn apply_call_return_effect(
-        &self,
+        &mut self,
         state: &mut Self::Domain,
         _block: BasicBlock,
-        return_places: crate::CallReturnPlaces<'_, 'tcx>,
+        return_places: CallReturnPlaces<'_, 'tcx>,
     ) {
         if state.is_reachable() {
             self.0.handle_call_return(return_places, state)
@@ -376,13 +391,11 @@ where
     }
 
     fn apply_switch_int_edge_effects(
-        &self,
+        &mut self,
         _block: BasicBlock,
-        discr: &Operand<'tcx>,
-        apply_edge_effects: &mut impl SwitchIntEdgeEffects<Self::Domain>,
+        _discr: &Operand<'tcx>,
+        _apply_edge_effects: &mut impl SwitchIntEdgeEffects<Self::Domain>,
     ) {
-        // FIXME: Dataflow framework provides no access to current state here.
-        self.0.handle_switch_int(discr, apply_edge_effects)
     }
 }
 
@@ -568,6 +581,14 @@ impl<V: Clone + HasTop + HasBottom> State<V> {
         }
     }
 
+    /// Retrieve the value stored for a place, or ⊤ if it is not tracked.
+    pub fn get_len(&self, place: PlaceRef<'_>, map: &Map) -> V {
+        match map.find_len(place) {
+            Some(place) => self.get_idx(place, map),
+            None => V::TOP,
+        }
+    }
+
     /// Retrieve the value stored for a place index, or ⊤ if it is not tracked.
     pub fn get_idx(&self, place: PlaceIndex, map: &Map) -> V {
         match &self.0 {
@@ -613,45 +634,36 @@ pub struct Map {
 }
 
 impl Map {
-    fn new() -> Self {
-        Self {
+    /// Returns a map that only tracks places whose type has scalar layout.
+    ///
+    /// This is currently the only way to create a [`Map`]. The way in which the tracked places are
+    /// chosen is an implementation detail and may not be relied upon (other than that their type
+    /// are scalars).
+    pub fn new<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, value_limit: Option<usize>) -> Self {
+        let mut map = Self {
             locals: IndexVec::new(),
             projections: FxHashMap::default(),
             places: IndexVec::new(),
             value_count: 0,
             inner_values: IndexVec::new(),
             inner_values_buffer: Vec::new(),
-        }
-    }
-
-    /// Returns a map that only tracks places whose type passes the filter.
-    ///
-    /// This is currently the only way to create a [`Map`]. The way in which the tracked places are
-    /// chosen is an implementation detail and may not be relied upon (other than that their type
-    /// passes the filter).
-    pub fn from_filter<'tcx>(
-        tcx: TyCtxt<'tcx>,
-        body: &Body<'tcx>,
-        filter: impl Fn(Ty<'tcx>) -> bool,
-        value_limit: Option<usize>,
-    ) -> Self {
-        let mut map = Self::new();
+        };
         let exclude = excluded_locals(body);
-        map.register_with_filter(tcx, body, filter, exclude, value_limit);
+        map.register(tcx, body, exclude, value_limit);
         debug!("registered {} places ({} nodes in total)", map.value_count, map.places.len());
         map
     }
 
-    /// Register all non-excluded places that pass the filter.
-    fn register_with_filter<'tcx>(
+    /// Register all non-excluded places that have scalar layout.
+    fn register<'tcx>(
         &mut self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
-        filter: impl Fn(Ty<'tcx>) -> bool,
         exclude: BitSet<Local>,
         value_limit: Option<usize>,
     ) {
         let mut worklist = VecDeque::with_capacity(value_limit.unwrap_or(body.local_decls.len()));
+        let param_env = tcx.param_env_reveal_all_normalized(body.source.def_id());
 
         // Start by constructing the places for each bare local.
         self.locals = IndexVec::from_elem(None, &body.local_decls);
@@ -666,7 +678,7 @@ impl Map {
             self.locals[local] = Some(place);
 
             // And push the eventual children places to the worklist.
-            self.register_children(tcx, place, decl.ty, &filter, &mut worklist);
+            self.register_children(tcx, param_env, place, decl.ty, &mut worklist);
         }
 
         // `place.elem1.elem2` with type `ty`.
@@ -689,7 +701,7 @@ impl Map {
             }
 
             // And push the eventual children places to the worklist.
-            self.register_children(tcx, place, ty, &filter, &mut worklist);
+            self.register_children(tcx, param_env, place, ty, &mut worklist);
         }
 
         // Pre-compute the tree of ValueIndex nested in each PlaceIndex.
@@ -719,42 +731,52 @@ impl Map {
     fn register_children<'tcx>(
         &mut self,
         tcx: TyCtxt<'tcx>,
+        param_env: ty::ParamEnv<'tcx>,
         place: PlaceIndex,
         ty: Ty<'tcx>,
-        filter: &impl Fn(Ty<'tcx>) -> bool,
         worklist: &mut VecDeque<(PlaceIndex, Option<TrackElem>, TrackElem, Ty<'tcx>)>,
     ) {
         // Allocate a value slot if it doesn't have one, and the user requested one.
-        if self.places[place].value_index.is_none() && filter(ty) {
+        assert!(self.places[place].value_index.is_none());
+        if tcx.layout_of(param_env.and(ty)).map_or(false, |layout| layout.abi.is_scalar()) {
             self.places[place].value_index = Some(self.value_count.into());
             self.value_count += 1;
         }
 
         // For enums, directly create the `Discriminant`, as that's their main use.
         if ty.is_enum() {
-            let discr_ty = ty.discriminant_ty(tcx);
-            if filter(discr_ty) {
-                let discr = *self
-                    .projections
-                    .entry((place, TrackElem::Discriminant))
-                    .or_insert_with(|| {
-                        // Prepend new child to the linked list.
-                        let next = self.places.push(PlaceInfo::new(Some(TrackElem::Discriminant)));
-                        self.places[next].next_sibling = self.places[place].first_child;
-                        self.places[place].first_child = Some(next);
-                        next
-                    });
+            // Prepend new child to the linked list.
+            let discr = self.places.push(PlaceInfo::new(Some(TrackElem::Discriminant)));
+            self.places[discr].next_sibling = self.places[place].first_child;
+            self.places[place].first_child = Some(discr);
+            let old = self.projections.insert((place, TrackElem::Discriminant), discr);
+            assert!(old.is_none());
 
-                // Allocate a value slot if it doesn't have one.
-                if self.places[discr].value_index.is_none() {
-                    self.places[discr].value_index = Some(self.value_count.into());
-                    self.value_count += 1;
-                }
-            }
+            // Allocate a value slot since it doesn't have one.
+            assert!(self.places[discr].value_index.is_none());
+            self.places[discr].value_index = Some(self.value_count.into());
+            self.value_count += 1;
+        }
+
+        if let Some(ref_ty) = ty.builtin_deref(true) && let ty::Slice(..) = ref_ty.ty.kind() {
+            assert!(self.places[place].value_index.is_none(), "slices are not scalars");
+
+            // Prepend new child to the linked list.
+            let len = self.places.push(PlaceInfo::new(Some(TrackElem::DerefLen)));
+            self.places[len].next_sibling = self.places[place].first_child;
+            self.places[place].first_child = Some(len);
+
+            let old = self.projections.insert((place, TrackElem::DerefLen), len);
+            assert!(old.is_none());
+
+            // Allocate a value slot since it doesn't have one.
+            assert!( self.places[len].value_index.is_none() );
+            self.places[len].value_index = Some(self.value_count.into());
+            self.value_count += 1;
         }
 
         // Recurse with all fields of this place.
-        iter_fields(ty, tcx, ty::ParamEnv::reveal_all(), |variant, field, ty| {
+        iter_fields(ty, tcx, param_env, |variant, field, ty| {
             worklist.push_back((
                 place,
                 variant.map(TrackElem::Variant),
@@ -821,6 +843,11 @@ impl Map {
         self.find_extra(place, [TrackElem::Discriminant])
     }
 
+    /// Locates the given place and applies `DerefLen`, if it exists in the tree.
+    pub fn find_len(&self, place: PlaceRef<'_>) -> Option<PlaceIndex> {
+        self.find_extra(place, [TrackElem::DerefLen])
+    }
+
     /// Iterate over all direct children.
     pub fn children(&self, parent: PlaceIndex) -> impl Iterator<Item = PlaceIndex> + '_ {
         Children::new(self, parent)
@@ -839,7 +866,7 @@ impl Map {
         tail_elem: Option<TrackElem>,
         f: &mut impl FnMut(ValueIndex),
     ) {
-        if place.has_deref() {
+        if place.is_indirect_first_projection() {
             // We do not track indirect places.
             return;
         }
@@ -972,6 +999,8 @@ pub enum TrackElem {
     Field(FieldIdx),
     Variant(VariantIdx),
     Discriminant,
+    // Length of a slice.
+    DerefLen,
 }
 
 impl<V, T> TryFrom<ProjectionElem<V, T>> for TrackElem {
@@ -999,14 +1028,14 @@ pub fn iter_fields<'tcx>(
                 f(None, field.into(), ty);
             }
         }
-        ty::Adt(def, substs) => {
+        ty::Adt(def, args) => {
             if def.is_union() {
                 return;
             }
             for (v_index, v_def) in def.variants().iter_enumerated() {
                 let variant = if def.is_struct() { None } else { Some(v_index) };
                 for (f_index, f_def) in v_def.fields.iter().enumerate() {
-                    let field_ty = f_def.ty(tcx, substs);
+                    let field_ty = f_def.ty(tcx, args);
                     let field_ty = tcx
                         .try_normalize_erasing_regions(param_env, field_ty)
                         .unwrap_or_else(|_| tcx.erase_regions(field_ty));
@@ -1014,8 +1043,8 @@ pub fn iter_fields<'tcx>(
                 }
             }
         }
-        ty::Closure(_, substs) => {
-            iter_fields(substs.as_closure().tupled_upvars_ty(), tcx, param_env, f);
+        ty::Closure(_, args) => {
+            iter_fields(args.as_closure().tupled_upvars_ty(), tcx, param_env, f);
         }
         _ => (),
     }
@@ -1099,10 +1128,10 @@ fn debug_with_context_rec<V: Debug + Eq>(
         let info_elem = map.places[child].proj_elem.unwrap();
         let child_place_str = match info_elem {
             TrackElem::Discriminant => {
-                format!("discriminant({})", place_str)
+                format!("discriminant({place_str})")
             }
             TrackElem::Variant(idx) => {
-                format!("({} as {:?})", place_str, idx)
+                format!("({place_str} as {idx:?})")
             }
             TrackElem::Field(field) => {
                 if place_str.starts_with('*') {
@@ -1110,6 +1139,9 @@ fn debug_with_context_rec<V: Debug + Eq>(
                 } else {
                     format!("{}.{}", place_str, field.index())
                 }
+            }
+            TrackElem::DerefLen => {
+                format!("Len(*{})", place_str)
             }
         };
         debug_with_context_rec(child, &child_place_str, new, old, map, f)?;

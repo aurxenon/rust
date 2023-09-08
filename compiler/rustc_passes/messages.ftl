@@ -4,11 +4,14 @@
 -passes_see_issue =
     see issue #{$issue} <https://github.com/rust-lang/rust/issues/{$issue}> for more information
 
-passes_abi =
-    abi: {$abi}
-
-passes_align =
-    align: {$align}
+passes_abi_invalid_attribute =
+    `#[rustc_abi]` can only be applied to function items, type aliases, and associated functions
+passes_abi_ne =
+    ABIs are not compatible
+    left ABI = {$left}
+    right ABI = {$right}
+passes_abi_of =
+    fn_abi_of({$fn_name}) = {$fn_abi}
 
 passes_allow_incoherent_impl =
     `rustc_allow_incoherent_impl` attribute should be applied to impl items.
@@ -98,12 +101,12 @@ passes_collapse_debuginfo =
     `collapse_debuginfo` attribute should be applied to macro definitions
     .label = not a macro definition
 
+passes_confusables = attribute should be applied to an inherent method
+    .label = not an inherent method
+
 passes_const_impl_const_trait =
     const `impl`s must be for traits marked with `#[const_trait]`
     .note = this trait must be annotated with `#[const_trait]`
-
-passes_const_trait =
-    attribute should be applied to a trait
 
 passes_continue_labeled_block =
     `continue` pointing to a labeled block
@@ -211,6 +214,19 @@ passes_doc_keyword_not_mod =
 passes_doc_keyword_only_impl =
     `#[doc(keyword = "...")]` should be used on impl blocks
 
+passes_doc_masked_not_extern_crate_self =
+    this attribute cannot be applied to an `extern crate self` item
+    .label = not applicable on `extern crate self` items
+    .extern_crate_self_label = `extern crate self` defined here
+
+passes_doc_masked_only_extern_crate =
+    this attribute can only be applied to an `extern crate` item
+    .label = only applicable on `extern crate` items
+    .not_an_extern_crate_label = not an `extern crate` item
+    .note = read <https://doc.rust-lang.org/unstable-book/language-features/doc-masked.html> for more information
+
+passes_doc_test_literal = `#![doc(test(...)]` does not take a literal
+
 passes_doc_test_takes_list =
     `#[doc(test(...)]` takes a list of attributes
 
@@ -267,6 +283,9 @@ passes_duplicate_lang_item_crate_depends =
     .first_definition_path = first definition in `{$orig_crate_name}` loaded from {$orig_path}
     .second_definition_path = second definition in `{$crate_name}` loaded from {$path}
 
+passes_empty_confusables =
+    expected at least one confusable name
+
 passes_export_name =
     attribute should be applied to a free function, impl method or static
     .label = not a free function, impl method or static
@@ -299,9 +318,6 @@ passes_has_incoherent_inherent_impl =
     `rustc_has_incoherent_inherent_impls` attribute should be applied to types or traits.
     .label = only adts, extern types and traits are supported
 
-passes_homogeneous_aggregate =
-    homogeneous_aggregate: {$homogeneous_aggregate}
-
 passes_ignored_attr =
     `#[{$sym}]` is ignored on struct fields and match arms
     .warn = {-passes_previously_accepted}
@@ -326,6 +342,9 @@ passes_implied_feature_not_exist =
 
 passes_incorrect_do_not_recommend_location =
     `#[do_not_recommend]` can only be placed on trait implementations
+
+passes_incorrect_meta_item = expected a quoted string literal
+passes_incorrect_meta_item_suggestion = consider surrounding this with quotes
 
 passes_incorrect_target =
     `{$name}` language item must be applied to a {$kind} with {$at_least ->
@@ -382,9 +401,18 @@ passes_lang_item_on_incorrect_target =
 
 passes_layout =
     layout error: {$layout_error}
-
+passes_layout_abi =
+    abi: {$abi}
+passes_layout_align =
+    align: {$align}
+passes_layout_homogeneous_aggregate =
+    homogeneous_aggregate: {$homogeneous_aggregate}
+passes_layout_invalid_attribute =
+    `#[rustc_layout]` can only be applied to `struct`/`enum`/`union` declarations and type aliases
 passes_layout_of =
     layout_of({$normalized_ty}) = {$ty_layout}
+passes_layout_size =
+    size: {$size}
 
 passes_link =
     attribute should be applied to an `extern` block with non-Rust ABI
@@ -408,6 +436,10 @@ passes_link_section =
 
 passes_macro_export =
     `#[macro_export]` only has an effect on macro definitions
+
+passes_macro_export_on_decl_macro =
+    `#[macro_export]` has no effect on declarative macro definitions
+    .note = declarative macros follow the same exporting rules as regular items
 
 passes_macro_use =
     `#[{$name}]` only has an effect on `extern crate` and modules
@@ -636,9 +668,6 @@ passes_should_be_applied_to_trait =
     attribute should be applied to a trait
     .label = not a trait
 
-passes_size =
-    size: {$size}
-
 passes_skipping_const_checks = skipping const checks
 
 passes_stability_promotable =
@@ -698,7 +727,7 @@ passes_unrecognized_field =
 
 passes_unrecognized_repr_hint =
     unrecognized representation hint
-    .help = valid reprs are `C`, `align`, `packed`, `transparent`, `simd`, `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `i128`, `u128`, `isize`, `usize`
+    .help = valid reprs are `Rust` (default), `C`, `align`, `packed`, `transparent`, `simd`, `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `i128`, `u128`, `isize`, `usize`
 
 passes_unused =
     unused attribute

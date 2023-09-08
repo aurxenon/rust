@@ -179,20 +179,52 @@ pub fn opts(os: &'static str, arch: Arch) -> TargetOptions {
     }
 }
 
-pub fn deployment_target(target: &Target) -> Option<String> {
+pub fn sdk_version(platform: u32) -> Option<(u32, u32)> {
+    // NOTE: These values are from an arbitrary point in time but shouldn't make it into the final
+    // binary since the final link command will have the current SDK version passed to it.
+    match platform {
+        object::macho::PLATFORM_MACOS => Some((13, 1)),
+        object::macho::PLATFORM_IOS
+        | object::macho::PLATFORM_IOSSIMULATOR
+        | object::macho::PLATFORM_TVOS
+        | object::macho::PLATFORM_TVOSSIMULATOR
+        | object::macho::PLATFORM_MACCATALYST => Some((16, 2)),
+        object::macho::PLATFORM_WATCHOS | object::macho::PLATFORM_WATCHOSSIMULATOR => Some((9, 1)),
+        _ => None,
+    }
+}
+
+pub fn platform(target: &Target) -> Option<u32> {
+    Some(match (&*target.os, &*target.abi) {
+        ("macos", _) => object::macho::PLATFORM_MACOS,
+        ("ios", "macabi") => object::macho::PLATFORM_MACCATALYST,
+        ("ios", "sim") => object::macho::PLATFORM_IOSSIMULATOR,
+        ("ios", _) => object::macho::PLATFORM_IOS,
+        ("watchos", "sim") => object::macho::PLATFORM_WATCHOSSIMULATOR,
+        ("watchos", _) => object::macho::PLATFORM_WATCHOS,
+        ("tvos", "sim") => object::macho::PLATFORM_TVOSSIMULATOR,
+        ("tvos", _) => object::macho::PLATFORM_TVOS,
+        _ => return None,
+    })
+}
+
+pub fn deployment_target(target: &Target) -> Option<(u32, u32)> {
     let (major, minor) = match &*target.os {
         "macos" => {
             // This does not need to be specific. It just needs to handle x86 vs M1.
             let arch = if target.arch == "x86" || target.arch == "x86_64" { X86_64 } else { Arm64 };
             macos_deployment_target(arch)
         }
-        "ios" => ios_deployment_target(),
+        "ios" => match &*target.abi {
+            "macabi" => mac_catalyst_deployment_target(),
+            _ => ios_deployment_target(),
+        },
         "watchos" => watchos_deployment_target(),
         "tvos" => tvos_deployment_target(),
         _ => return None,
     };
 
-    Some(format!("{major}.{minor}"))
+    Some((major, minor))
 }
 
 fn from_set_deployment_target(var_name: &str) -> Option<(u32, u32)> {
@@ -240,7 +272,12 @@ fn link_env_remove(arch: Arch, os: &'static str) -> StaticCow<[StaticCow<str>]> 
         // Remove the `SDKROOT` environment variable if it's clearly set for the wrong platform, which
         // may occur when we're linking a custom build script while targeting iOS for example.
         if let Ok(sdkroot) = env::var("SDKROOT") {
-            if sdkroot.contains("iPhoneOS.platform") || sdkroot.contains("iPhoneSimulator.platform")
+            if sdkroot.contains("iPhoneOS.platform")
+                || sdkroot.contains("iPhoneSimulator.platform")
+                || sdkroot.contains("AppleTVOS.platform")
+                || sdkroot.contains("AppleTVSimulator.platform")
+                || sdkroot.contains("WatchOS.platform")
+                || sdkroot.contains("WatchSimulator.platform")
             {
                 env_remove.push("SDKROOT".into())
             }
@@ -249,6 +286,7 @@ fn link_env_remove(arch: Arch, os: &'static str) -> StaticCow<[StaticCow<str>]> 
         // "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld",
         // although this is apparently ignored when using the linker at "/usr/bin/ld".
         env_remove.push("IPHONEOS_DEPLOYMENT_TARGET".into());
+        env_remove.push("TVOS_DEPLOYMENT_TARGET".into());
         env_remove.into()
     } else {
         // Otherwise if cross-compiling for a different OS/SDK, remove any part
@@ -266,6 +304,11 @@ fn link_env_remove(arch: Arch, os: &'static str) -> StaticCow<[StaticCow<str>]> 
 fn ios_deployment_target() -> (u32, u32) {
     // If you are looking for the default deployment target, prefer `rustc --print deployment-target`.
     from_set_deployment_target("IPHONEOS_DEPLOYMENT_TARGET").unwrap_or((7, 0))
+}
+
+fn mac_catalyst_deployment_target() -> (u32, u32) {
+    // If you are looking for the default deployment target, prefer `rustc --print deployment-target`.
+    from_set_deployment_target("IPHONEOS_DEPLOYMENT_TARGET").unwrap_or((14, 0))
 }
 
 pub fn ios_llvm_target(arch: Arch) -> String {
@@ -297,6 +340,16 @@ fn tvos_deployment_target() -> (u32, u32) {
 fn tvos_lld_platform_version() -> String {
     let (major, minor) = tvos_deployment_target();
     format!("{major}.{minor}")
+}
+
+pub fn tvos_llvm_target(arch: Arch) -> String {
+    let (major, minor) = tvos_deployment_target();
+    format!("{}-apple-tvos{}.{}.0", arch.target_name(), major, minor)
+}
+
+pub fn tvos_sim_llvm_target(arch: Arch) -> String {
+    let (major, minor) = tvos_deployment_target();
+    format!("{}-apple-tvos{}.{}.0-simulator", arch.target_name(), major, minor)
 }
 
 fn watchos_deployment_target() -> (u32, u32) {

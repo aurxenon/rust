@@ -19,13 +19,13 @@
 #![feature(panic_unwind)]
 #![feature(staged_api)]
 #![feature(std_internals)]
-#![feature(abi_thiscall)]
 #![feature(rustc_attrs)]
 #![panic_runtime]
 #![feature(panic_runtime)]
 #![feature(c_unwind)]
 // `real_imp` is unused with Miri, so silence warnings.
 #![cfg_attr(miri, allow(dead_code))]
+#![allow(internal_features)]
 
 use alloc::boxed::Box;
 use core::any::Any;

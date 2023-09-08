@@ -1,6 +1,3 @@
-// [next] compile-flags: -Zlower-impl-trait-in-trait-to-assoc-ty
-// revisions: current next
-
 #![feature(return_position_impl_trait_in_trait)]
 #![allow(incomplete_features)]
 
@@ -11,7 +8,7 @@ trait Foo {
 }
 
 impl Foo for u32 {
-    fn baz(&self) -> u32 {
+    fn baz(&self) -> impl Debug {
         32
     }
 }
@@ -22,4 +19,5 @@ fn main() {
     //~| ERROR the trait `Foo` cannot be made into an object
     let s = i.baz();
     //~^ ERROR the trait `Foo` cannot be made into an object
+    //~| ERROR the trait `Foo` cannot be made into an object
 }

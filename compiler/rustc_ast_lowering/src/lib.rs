@@ -142,19 +142,18 @@ struct LoweringContext<'a, 'hir> {
     /// defined on the TAIT, so we have type Foo<'a1> = ... and we establish a mapping in this
     /// field from the original parameter 'a to the new parameter 'a1.
     generics_def_id_map: Vec<FxHashMap<LocalDefId, LocalDefId>>,
+
+    host_param_id: Option<LocalDefId>,
 }
 
 trait ResolverAstLoweringExt {
     fn legacy_const_generic_args(&self, expr: &Expr) -> Option<Vec<usize>>;
     fn get_partial_res(&self, id: NodeId) -> Option<PartialRes>;
     fn get_import_res(&self, id: NodeId) -> PerNS<Option<Res<NodeId>>>;
-    // Clones the resolution (if any) on 'source' and applies it
-    // to 'target'. Used when desugaring a `UseTreeKind::Nested` to
-    // multiple `UseTreeKind::Simple`s
-    fn clone_res(&mut self, source: NodeId, target: NodeId);
     fn get_label_res(&self, id: NodeId) -> Option<NodeId>;
     fn get_lifetime_res(&self, id: NodeId) -> Option<LifetimeRes>;
     fn take_extra_lifetime_params(&mut self, id: NodeId) -> Vec<(Ident, NodeId, LifetimeRes)>;
+    fn remap_extra_lifetime_params(&mut self, from: NodeId, to: NodeId);
     fn decl_macro_kind(&self, def_id: LocalDefId) -> MacroKind;
 }
 
@@ -182,12 +181,6 @@ impl ResolverAstLoweringExt for ResolverAstLowering {
         }
 
         None
-    }
-
-    fn clone_res(&mut self, source: NodeId, target: NodeId) {
-        if let Some(res) = self.partial_res_map.get(&source) {
-            self.partial_res_map.insert(target, *res);
-        }
     }
 
     /// Obtains resolution for a `NodeId` with a single resolution.
@@ -221,6 +214,11 @@ impl ResolverAstLoweringExt for ResolverAstLowering {
         self.extra_lifetime_params_map.remove(&id).unwrap_or_default()
     }
 
+    fn remap_extra_lifetime_params(&mut self, from: NodeId, to: NodeId) {
+        let lifetimes = self.extra_lifetime_params_map.remove(&from).unwrap_or_default();
+        self.extra_lifetime_params_map.insert(to, lifetimes);
+    }
+
     fn decl_macro_kind(&self, def_id: LocalDefId) -> MacroKind {
         self.builtin_macro_kinds.get(&def_id).copied().unwrap_or(MacroKind::Bang)
     }
@@ -244,7 +242,7 @@ enum ImplTraitContext {
     ReturnPositionOpaqueTy {
         /// Origin: Either OpaqueTyOrigin::FnReturn or OpaqueTyOrigin::AsyncFn,
         origin: hir::OpaqueTyOrigin,
-        in_trait: bool,
+        fn_kind: FnDeclKind,
     },
     /// Impl trait in type aliases.
     TypeAliasesOpaqueTy { in_assoc_ty: bool },
@@ -320,7 +318,7 @@ impl std::fmt::Display for ImplTraitPosition {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum FnDeclKind {
     Fn,
     Inherent,
@@ -465,7 +463,7 @@ pub fn lower_to_hir(tcx: TyCtxt<'_>, (): ()) -> hir::Crate<'_> {
 
     // Don't hash unless necessary, because it's expensive.
     let opt_hir_hash =
-        if tcx.sess.needs_crate_hash() { Some(compute_hir_hash(tcx, &owners)) } else { None };
+        if tcx.needs_crate_hash() { Some(compute_hir_hash(tcx, &owners)) } else { None };
     hir::Crate { owners, opt_hir_hash }
 }
 
@@ -520,11 +518,6 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
     /// resolver (if any).
     fn orig_opt_local_def_id(&self, node: NodeId) -> Option<LocalDefId> {
         self.resolver.node_id_to_def_id.get(&node).map(|local_def_id| *local_def_id)
-    }
-
-    fn orig_local_def_id(&self, node: NodeId) -> LocalDefId {
-        self.orig_opt_local_def_id(node)
-            .unwrap_or_else(|| panic!("no entry for node id: `{node:?}`"))
     }
 
     /// Given the id of some node in the AST, finds the `LocalDefId` associated with it by the name
@@ -661,7 +654,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         let bodies = SortedMap::from_presorted_elements(bodies);
 
         // Don't hash unless necessary, because it's expensive.
-        let (opt_hash_including_bodies, attrs_hash) = if self.tcx.sess.needs_crate_hash() {
+        let (opt_hash_including_bodies, attrs_hash) = if self.tcx.needs_crate_hash() {
             self.tcx.with_stable_hashing_context(|mut hcx| {
                 let mut stable_hasher = StableHasher::new();
                 hcx.with_hir_bodies(node.def_id(), &bodies, |hcx| {
@@ -678,8 +671,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         } else {
             (None, None)
         };
-        let (nodes, parenting) =
-            index::index_hir(self.tcx.sess, &*self.tcx.definitions_untracked(), node, &bodies);
+        let (nodes, parenting) = index::index_hir(self.tcx, node, &bodies);
         let nodes = hir::OwnerNodes { opt_hash_including_bodies, nodes, bodies };
         let attrs = hir::AttributeMap { map: attrs, opt_hash: attrs_hash };
 
@@ -1102,6 +1094,11 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         // constructing the HIR for `impl bounds...` and then lowering that.
 
                         let impl_trait_node_id = self.next_node_id();
+                        // Shift `impl Trait` lifetime captures from the associated type bound's
+                        // node id to the opaque node id, so that the opaque can actually use
+                        // these lifetime bounds.
+                        self.resolver
+                            .remap_extra_lifetime_params(constraint.id, impl_trait_node_id);
 
                         self.with_dyn_type_scope(false, |this| {
                             let node_id = this.next_node_id();
@@ -1277,6 +1274,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         span: t.span
                     },
                     itctx,
+                    ast::Const::No,
                 );
                 let bounds = this.arena.alloc_from_iter([bound]);
                 let lifetime_bound = this.elided_dyn_bound(t.span);
@@ -1287,7 +1285,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         }
 
         let id = self.lower_node_id(t.id);
-        let qpath = self.lower_qpath(t.id, qself, path, param_mode, itctx);
+        let qpath = self.lower_qpath(t.id, qself, path, param_mode, itctx, None);
         self.ty_path(id, t.span, qpath)
     }
 
@@ -1305,6 +1303,18 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             TyKind::Err => {
                 hir::TyKind::Err(self.tcx.sess.delay_span_bug(t.span, "TyKind::Err lowered"))
             }
+            // FIXME(unnamed_fields): IMPLEMENTATION IN PROGRESS
+            #[allow(rustc::untranslatable_diagnostic)]
+            #[allow(rustc::diagnostic_outside_of_impl)]
+            TyKind::AnonStruct(ref _fields) => hir::TyKind::Err(
+                self.tcx.sess.span_err(t.span, "anonymous structs are unimplemented"),
+            ),
+            // FIXME(unnamed_fields): IMPLEMENTATION IN PROGRESS
+            #[allow(rustc::untranslatable_diagnostic)]
+            #[allow(rustc::diagnostic_outside_of_impl)]
+            TyKind::AnonUnion(ref _fields) => hir::TyKind::Err(
+                self.tcx.sess.span_err(t.span, "anonymous unions are unimplemented"),
+            ),
             TyKind::Slice(ty) => hir::TyKind::Slice(self.lower_ty(ty, itctx)),
             TyKind::Ptr(mt) => hir::TyKind::Ptr(self.lower_mt(mt, itctx)),
             TyKind::Ref(region, mt) => {
@@ -1371,10 +1381,12 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         this.arena.alloc_from_iter(bounds.iter().filter_map(|bound| match bound {
                             GenericBound::Trait(
                                 ty,
-                                TraitBoundModifier::None
+                                modifier @ (TraitBoundModifier::None
                                 | TraitBoundModifier::MaybeConst
-                                | TraitBoundModifier::Negative,
-                            ) => Some(this.lower_poly_trait_ref(ty, itctx)),
+                                | TraitBoundModifier::Negative),
+                            ) => {
+                                Some(this.lower_poly_trait_ref(ty, itctx, modifier.to_constness()))
+                            }
                             // `~const ?Bound` will cause an error during AST validation
                             // anyways, so treat it like `?Bound` as compilation proceeds.
                             GenericBound::Trait(
@@ -1399,13 +1411,13 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             TyKind::ImplTrait(def_node_id, bounds) => {
                 let span = t.span;
                 match itctx {
-                    ImplTraitContext::ReturnPositionOpaqueTy { origin, in_trait } => self
+                    ImplTraitContext::ReturnPositionOpaqueTy { origin, fn_kind } => self
                         .lower_opaque_impl_trait(
                             span,
                             *origin,
                             *def_node_id,
                             bounds,
-                            *in_trait,
+                            Some(*fn_kind),
                             itctx,
                         ),
                     &ImplTraitContext::TypeAliasesOpaqueTy { in_assoc_ty } => self
@@ -1414,7 +1426,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                             hir::OpaqueTyOrigin::TyAlias { in_assoc_ty },
                             *def_node_id,
                             bounds,
-                            false,
+                            None,
                             itctx,
                         ),
                     ImplTraitContext::Universal => {
@@ -1521,7 +1533,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         origin: hir::OpaqueTyOrigin,
         opaque_ty_node_id: NodeId,
         bounds: &GenericBounds,
-        in_trait: bool,
+        fn_kind: Option<FnDeclKind>,
         itctx: &ImplTraitContext,
     ) -> hir::TyKind<'hir> {
         // Make sure we know that some funky desugaring has been going on here.
@@ -1531,6 +1543,57 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         // frequently opened issues show.
         let opaque_ty_span = self.mark_span_with_reason(DesugaringKind::OpaqueTy, span, None);
 
+        let captured_lifetimes_to_duplicate = match origin {
+            hir::OpaqueTyOrigin::TyAlias { .. } => {
+                // in a TAIT like `type Foo<'a> = impl Foo<'a>`, we don't duplicate any
+                // lifetimes, since we don't have the issue that any are late-bound.
+                Vec::new()
+            }
+            hir::OpaqueTyOrigin::FnReturn(..) => {
+                if let FnDeclKind::Impl | FnDeclKind::Trait =
+                    fn_kind.expect("expected RPITs to be lowered with a FnKind")
+                {
+                    // return-position impl trait in trait was decided to capture all
+                    // in-scope lifetimes, which we collect for all opaques during resolution.
+                    self.resolver
+                        .take_extra_lifetime_params(opaque_ty_node_id)
+                        .into_iter()
+                        .map(|(ident, id, _)| Lifetime { id, ident })
+                        .collect()
+                } else {
+                    // in fn return position, like the `fn test<'a>() -> impl Debug + 'a`
+                    // example, we only need to duplicate lifetimes that appear in the
+                    // bounds, since those are the only ones that are captured by the opaque.
+                    lifetime_collector::lifetimes_in_bounds(&self.resolver, bounds)
+                }
+            }
+            hir::OpaqueTyOrigin::AsyncFn(..) => {
+                unreachable!("should be using `lower_async_fn_ret_ty`")
+            }
+        };
+        debug!(?captured_lifetimes_to_duplicate);
+
+        self.lower_opaque_inner(
+            opaque_ty_node_id,
+            origin,
+            matches!(fn_kind, Some(FnDeclKind::Trait)),
+            captured_lifetimes_to_duplicate,
+            span,
+            opaque_ty_span,
+            |this| this.lower_param_bounds(bounds, itctx),
+        )
+    }
+
+    fn lower_opaque_inner(
+        &mut self,
+        opaque_ty_node_id: NodeId,
+        origin: hir::OpaqueTyOrigin,
+        in_trait: bool,
+        captured_lifetimes_to_duplicate: Vec<Lifetime>,
+        span: Span,
+        opaque_ty_span: Span,
+        lower_item_bounds: impl FnOnce(&mut Self) -> &'hir [hir::GenericBound<'hir>],
+    ) -> hir::TyKind<'hir> {
         let opaque_ty_def_id = self.create_def(
             self.current_hir_id_owner.def_id,
             opaque_ty_node_id,
@@ -1539,186 +1602,39 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         );
         debug!(?opaque_ty_def_id);
 
-        // Contains the new lifetime definitions created for the TAIT (if any).
-        let mut collected_lifetimes = Vec::new();
+        // Map from captured (old) lifetime to synthetic (new) lifetime.
+        // Used to resolve lifetimes in the bounds of the opaque.
+        let mut captured_to_synthesized_mapping = FxHashMap::default();
+        // List of (early-bound) synthetic lifetimes that are owned by the opaque.
+        // This is used to create the `hir::Generics` owned by the opaque.
+        let mut synthesized_lifetime_definitions = vec![];
+        // Pairs of lifetime arg (that resolves to the captured lifetime)
+        // and the def-id of the (early-bound) synthetic lifetime definition.
+        // This is used both to create generics for the `TyKind::OpaqueDef` that
+        // we return, and also as a captured lifetime mapping for RPITITs.
+        let mut synthesized_lifetime_args = vec![];
 
-        // If this came from a TAIT (as opposed to a function that returns an RPIT), we only want
-        // to capture the lifetimes that appear in the bounds. So visit the bounds to find out
-        // exactly which ones those are.
-        let lifetimes_to_remap = match origin {
-            hir::OpaqueTyOrigin::TyAlias { .. } => {
-                // in a TAIT like `type Foo<'a> = impl Foo<'a>`, we don't keep all the lifetime parameters
-                Vec::new()
-            }
-            hir::OpaqueTyOrigin::AsyncFn(..) | hir::OpaqueTyOrigin::FnReturn(..) => {
-                // in fn return position, like the `fn test<'a>() -> impl Debug + 'a` example,
-                // we only keep the lifetimes that appear in the `impl Debug` itself:
-                lifetime_collector::lifetimes_in_bounds(&self.resolver, bounds)
-            }
-        };
-        debug!(?lifetimes_to_remap);
-
-        self.with_hir_id_owner(opaque_ty_node_id, |lctx| {
-            let mut new_remapping = FxHashMap::default();
-
-            // If this opaque type is only capturing a subset of the lifetimes (those that appear
-            // in bounds), then create the new lifetime parameters required and create a mapping
-            // from the old `'a` (on the function) to the new `'a` (on the opaque type).
-            collected_lifetimes = lctx.create_lifetime_defs(
-                opaque_ty_def_id,
-                &lifetimes_to_remap,
-                &mut new_remapping,
-            );
-            debug!(?collected_lifetimes);
-            debug!(?new_remapping);
-
-            // Install the remapping from old to new (if any):
-            lctx.with_remapping(new_remapping, |lctx| {
-                // This creates HIR lifetime definitions as `hir::GenericParam`, in the given
-                // example `type TestReturn<'a, T, 'x> = impl Debug + 'x`, it creates a collection
-                // containing `&['x]`.
-                let lifetime_defs = lctx.arena.alloc_from_iter(collected_lifetimes.iter().map(
-                    |&(new_node_id, lifetime)| {
-                        let hir_id = lctx.lower_node_id(new_node_id);
-                        debug_assert_ne!(lctx.opt_local_def_id(new_node_id), None);
-
-                        let (name, kind) = if lifetime.ident.name == kw::UnderscoreLifetime {
-                            (hir::ParamName::Fresh, hir::LifetimeParamKind::Elided)
-                        } else {
-                            (
-                                hir::ParamName::Plain(lifetime.ident),
-                                hir::LifetimeParamKind::Explicit,
-                            )
-                        };
-
-                        hir::GenericParam {
-                            hir_id,
-                            def_id: lctx.local_def_id(new_node_id),
-                            name,
-                            span: lifetime.ident.span,
-                            pure_wrt_drop: false,
-                            kind: hir::GenericParamKind::Lifetime { kind },
-                            colon_span: None,
-                            source: hir::GenericParamSource::Generics,
-                        }
-                    },
-                ));
-                debug!(?lifetime_defs);
-
-                // Then when we lower the param bounds, references to 'a are remapped to 'a1, so we
-                // get back Debug + 'a1, which is suitable for use on the TAIT.
-                let hir_bounds = lctx.lower_param_bounds(bounds, itctx);
-                debug!(?hir_bounds);
-
-                let opaque_ty_item = hir::OpaqueTy {
-                    generics: self.arena.alloc(hir::Generics {
-                        params: lifetime_defs,
-                        predicates: &[],
-                        has_where_clause_predicates: false,
-                        where_clause_span: lctx.lower_span(span),
-                        span: lctx.lower_span(span),
-                    }),
-                    bounds: hir_bounds,
-                    origin,
-                    in_trait,
-                };
-                debug!(?opaque_ty_item);
-
-                lctx.generate_opaque_type(opaque_ty_def_id, opaque_ty_item, span, opaque_ty_span)
-            })
-        });
-
-        // This creates HIR lifetime arguments as `hir::GenericArg`, in the given example `type
-        // TestReturn<'a, T, 'x> = impl Debug + 'x`, it creates a collection containing `&['x]`.
-        let lifetimes =
-            self.arena.alloc_from_iter(collected_lifetimes.into_iter().map(|(_, lifetime)| {
-                let id = self.next_node_id();
-                let l = self.new_named_lifetime(lifetime.id, id, lifetime.ident);
-                hir::GenericArg::Lifetime(l)
-            }));
-        debug!(?lifetimes);
-
-        // `impl Trait` now just becomes `Foo<'a, 'b, ..>`.
-        hir::TyKind::OpaqueDef(
-            hir::ItemId { owner_id: hir::OwnerId { def_id: opaque_ty_def_id } },
-            lifetimes,
-            in_trait,
-        )
-    }
-
-    /// Registers a new opaque type with the proper `NodeId`s and
-    /// returns the lowered node-ID for the opaque type.
-    fn generate_opaque_type(
-        &mut self,
-        opaque_ty_id: LocalDefId,
-        opaque_ty_item: hir::OpaqueTy<'hir>,
-        span: Span,
-        opaque_ty_span: Span,
-    ) -> hir::OwnerNode<'hir> {
-        let opaque_ty_item_kind = hir::ItemKind::OpaqueTy(opaque_ty_item);
-        // Generate an `type Foo = impl Trait;` declaration.
-        trace!("registering opaque type with id {:#?}", opaque_ty_id);
-        let opaque_ty_item = hir::Item {
-            owner_id: hir::OwnerId { def_id: opaque_ty_id },
-            ident: Ident::empty(),
-            kind: opaque_ty_item_kind,
-            vis_span: self.lower_span(span.shrink_to_lo()),
-            span: self.lower_span(opaque_ty_span),
-        };
-        hir::OwnerNode::Item(self.arena.alloc(opaque_ty_item))
-    }
-
-    /// Given a `parent_def_id`, a list of `lifetimes_in_bounds` and a `remapping` hash to be
-    /// filled, this function creates new definitions for `Param` and `Fresh` lifetimes, inserts the
-    /// new definition, adds it to the remapping with the definition of the given lifetime and
-    /// returns a list of lifetimes to be lowered afterwards.
-    fn create_lifetime_defs(
-        &mut self,
-        parent_def_id: LocalDefId,
-        lifetimes_in_bounds: &[Lifetime],
-        remapping: &mut FxHashMap<LocalDefId, LocalDefId>,
-    ) -> Vec<(NodeId, Lifetime)> {
-        let mut result = Vec::new();
-
-        for lifetime in lifetimes_in_bounds {
+        for lifetime in captured_lifetimes_to_duplicate {
             let res = self.resolver.get_lifetime_res(lifetime.id).unwrap_or(LifetimeRes::Error);
-            debug!(?res);
-
-            match res {
-                LifetimeRes::Param { param: old_def_id, binder: _ } => {
-                    if remapping.get(&old_def_id).is_none() {
-                        let node_id = self.next_node_id();
-
-                        let new_def_id = self.create_def(
-                            parent_def_id,
-                            node_id,
-                            DefPathData::LifetimeNs(lifetime.ident.name),
-                            lifetime.ident.span,
-                        );
-                        remapping.insert(old_def_id, new_def_id);
-
-                        result.push((node_id, *lifetime));
-                    }
-                }
+            let old_def_id = match res {
+                LifetimeRes::Param { param: old_def_id, binder: _ } => old_def_id,
 
                 LifetimeRes::Fresh { param, binder: _ } => {
                     debug_assert_eq!(lifetime.ident.name, kw::UnderscoreLifetime);
-                    if let Some(old_def_id) = self.orig_opt_local_def_id(param) && remapping.get(&old_def_id).is_none() {
-                        let node_id = self.next_node_id();
-
-                        let new_def_id = self.create_def(
-                            parent_def_id,
-                            node_id,
-                            DefPathData::LifetimeNs(kw::UnderscoreLifetime),
-                            lifetime.ident.span,
-                        );
-                        remapping.insert(old_def_id, new_def_id);
-
-                        result.push((node_id, *lifetime));
+                    if let Some(old_def_id) = self.orig_opt_local_def_id(param) {
+                        old_def_id
+                    } else {
+                        self.tcx
+                            .sess
+                            .delay_span_bug(lifetime.ident.span, "no def-id for fresh lifetime");
+                        continue;
                     }
                 }
 
-                LifetimeRes::Static | LifetimeRes::Error => {}
+                // Opaques do not capture `'static`
+                LifetimeRes::Static | LifetimeRes::Error => {
+                    continue;
+                }
 
                 res => {
                     let bug_msg = format!(
@@ -1727,10 +1643,109 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     );
                     span_bug!(lifetime.ident.span, "{}", bug_msg);
                 }
+            };
+
+            if captured_to_synthesized_mapping.get(&old_def_id).is_none() {
+                // Create a new lifetime parameter local to the opaque.
+                let duplicated_lifetime_node_id = self.next_node_id();
+                let duplicated_lifetime_def_id = self.create_def(
+                    opaque_ty_def_id,
+                    duplicated_lifetime_node_id,
+                    DefPathData::LifetimeNs(lifetime.ident.name),
+                    lifetime.ident.span,
+                );
+                captured_to_synthesized_mapping.insert(old_def_id, duplicated_lifetime_def_id);
+                // FIXME: Instead of doing this, we could move this whole loop
+                // into the `with_hir_id_owner`, then just directly construct
+                // the `hir::GenericParam` here.
+                synthesized_lifetime_definitions.push((
+                    duplicated_lifetime_node_id,
+                    duplicated_lifetime_def_id,
+                    lifetime.ident,
+                ));
+
+                // Now make an arg that we can use for the substs of the opaque tykind.
+                let id = self.next_node_id();
+                let lifetime_arg = self.new_named_lifetime_with_res(id, lifetime.ident, res);
+                let duplicated_lifetime_def_id = self.local_def_id(duplicated_lifetime_node_id);
+                synthesized_lifetime_args.push((lifetime_arg, duplicated_lifetime_def_id))
             }
         }
 
-        result
+        self.with_hir_id_owner(opaque_ty_node_id, |this| {
+            // Install the remapping from old to new (if any). This makes sure that
+            // any lifetimes that would have resolved to the def-id of captured
+            // lifetimes are remapped to the new *synthetic* lifetimes of the opaque.
+            let bounds = this
+                .with_remapping(captured_to_synthesized_mapping, |this| lower_item_bounds(this));
+
+            let generic_params = this.arena.alloc_from_iter(
+                synthesized_lifetime_definitions.iter().map(|&(new_node_id, new_def_id, ident)| {
+                    let hir_id = this.lower_node_id(new_node_id);
+                    let (name, kind) = if ident.name == kw::UnderscoreLifetime {
+                        (hir::ParamName::Fresh, hir::LifetimeParamKind::Elided)
+                    } else {
+                        (hir::ParamName::Plain(ident), hir::LifetimeParamKind::Explicit)
+                    };
+
+                    hir::GenericParam {
+                        hir_id,
+                        def_id: new_def_id,
+                        name,
+                        span: ident.span,
+                        pure_wrt_drop: false,
+                        kind: hir::GenericParamKind::Lifetime { kind },
+                        colon_span: None,
+                        source: hir::GenericParamSource::Generics,
+                    }
+                }),
+            );
+            debug!("lower_async_fn_ret_ty: generic_params={:#?}", generic_params);
+
+            let lifetime_mapping = self.arena.alloc_slice(&synthesized_lifetime_args);
+
+            let opaque_ty_item = hir::OpaqueTy {
+                generics: this.arena.alloc(hir::Generics {
+                    params: generic_params,
+                    predicates: &[],
+                    has_where_clause_predicates: false,
+                    where_clause_span: this.lower_span(span),
+                    span: this.lower_span(span),
+                }),
+                bounds,
+                origin,
+                lifetime_mapping,
+                in_trait,
+            };
+
+            // Generate an `type Foo = impl Trait;` declaration.
+            trace!("registering opaque type with id {:#?}", opaque_ty_def_id);
+            let opaque_ty_item = hir::Item {
+                owner_id: hir::OwnerId { def_id: opaque_ty_def_id },
+                ident: Ident::empty(),
+                kind: hir::ItemKind::OpaqueTy(this.arena.alloc(opaque_ty_item)),
+                vis_span: this.lower_span(span.shrink_to_lo()),
+                span: this.lower_span(opaque_ty_span),
+            };
+
+            hir::OwnerNode::Item(this.arena.alloc(opaque_ty_item))
+        });
+
+        let generic_args = self.arena.alloc_from_iter(
+            synthesized_lifetime_args
+                .iter()
+                .map(|(lifetime, _)| hir::GenericArg::Lifetime(*lifetime)),
+        );
+
+        // Create the `Foo<...>` reference itself. Note that the `type
+        // Foo = impl Trait` is, internally, created as a child of the
+        // async fn, so the *type parameters* are inherited. It's
+        // only the lifetime parameters that we must supply.
+        hir::TyKind::OpaqueDef(
+            hir::ItemId { owner_id: hir::OwnerId { def_id: opaque_ty_def_id } },
+            generic_args,
+            in_trait,
+        )
     }
 
     fn lower_fn_params_to_names(&mut self, decl: &FnDecl) -> &'hir [Ident] {
@@ -1808,12 +1823,8 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 }
             }
 
-            self.lower_async_fn_ret_ty(
-                &decl.output,
-                fn_node_id,
-                ret_id,
-                matches!(kind, FnDeclKind::Trait),
-            )
+            let fn_def_id = self.local_def_id(fn_node_id);
+            self.lower_async_fn_ret_ty(&decl.output, fn_def_id, ret_id, kind)
         } else {
             match &decl.output {
                 FnRetTy::Ty(ty) => {
@@ -1821,7 +1832,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         let fn_def_id = self.local_def_id(fn_node_id);
                         ImplTraitContext::ReturnPositionOpaqueTy {
                             origin: hir::OpaqueTyOrigin::FnReturn(fn_def_id),
-                            in_trait: matches!(kind, FnDeclKind::Trait),
+                            fn_kind: kind,
                         }
                     } else {
                         let position = match kind {
@@ -1887,142 +1898,34 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
     fn lower_async_fn_ret_ty(
         &mut self,
         output: &FnRetTy,
-        fn_node_id: NodeId,
+        fn_def_id: LocalDefId,
         opaque_ty_node_id: NodeId,
-        in_trait: bool,
+        fn_kind: FnDeclKind,
     ) -> hir::FnRetTy<'hir> {
-        let span = output.span();
-
+        let span = self.lower_span(output.span());
         let opaque_ty_span = self.mark_span_with_reason(DesugaringKind::Async, span, None);
 
-        let fn_def_id = self.local_def_id(fn_node_id);
+        let captured_lifetimes: Vec<_> = self
+            .resolver
+            .take_extra_lifetime_params(opaque_ty_node_id)
+            .into_iter()
+            .map(|(ident, id, _)| Lifetime { id, ident })
+            .collect();
 
-        let opaque_ty_def_id =
-            self.create_def(fn_def_id, opaque_ty_node_id, DefPathData::ImplTrait, opaque_ty_span);
-
-        // When we create the opaque type for this async fn, it is going to have
-        // to capture all the lifetimes involved in the signature (including in the
-        // return type). This is done by introducing lifetime parameters for:
-        //
-        // - all the explicitly declared lifetimes from the impl and function itself;
-        // - all the elided lifetimes in the fn arguments;
-        // - all the elided lifetimes in the return type.
-        //
-        // So for example in this snippet:
-        //
-        // ```rust
-        // impl<'a> Foo<'a> {
-        //   async fn bar<'b>(&self, x: &'b Vec<f64>, y: &str) -> &u32 {
-        //   //               ^ '0                       ^ '1     ^ '2
-        //   // elided lifetimes used below
-        //   }
-        // }
-        // ```
-        //
-        // we would create an opaque type like:
-        //
-        // ```
-        // type Bar<'a, 'b, '0, '1, '2> = impl Future<Output = &'2 u32>;
-        // ```
-        //
-        // and we would then desugar `bar` to the equivalent of:
-        //
-        // ```rust
-        // impl<'a> Foo<'a> {
-        //   fn bar<'b, '0, '1>(&'0 self, x: &'b Vec<f64>, y: &'1 str) -> Bar<'a, 'b, '0, '1, '_>
-        // }
-        // ```
-        //
-        // Note that the final parameter to `Bar` is `'_`, not `'2` --
-        // this is because the elided lifetimes from the return type
-        // should be figured out using the ordinary elision rules, and
-        // this desugaring achieves that.
-
-        // Calculate all the lifetimes that should be captured
-        // by the opaque type. This should include all in-scope
-        // lifetime parameters, including those defined in-band.
-
-        // Contains the new lifetime definitions created for the TAIT (if any) generated for the
-        // return type.
-        let mut collected_lifetimes = Vec::new();
-        let mut new_remapping = FxHashMap::default();
-
-        let extra_lifetime_params = self.resolver.take_extra_lifetime_params(opaque_ty_node_id);
-        debug!(?extra_lifetime_params);
-        for (ident, outer_node_id, outer_res) in extra_lifetime_params {
-            let outer_def_id = self.orig_local_def_id(outer_node_id);
-            let inner_node_id = self.next_node_id();
-
-            // Add a definition for the in scope lifetime def.
-            let inner_def_id = self.create_def(
-                opaque_ty_def_id,
-                inner_node_id,
-                DefPathData::LifetimeNs(ident.name),
-                ident.span,
-            );
-            new_remapping.insert(outer_def_id, inner_def_id);
-
-            let inner_res = match outer_res {
-                // Input lifetime like `'a`:
-                LifetimeRes::Param { param, .. } => {
-                    LifetimeRes::Param { param, binder: fn_node_id }
-                }
-                // Input lifetime like `'1`:
-                LifetimeRes::Fresh { param, .. } => {
-                    LifetimeRes::Fresh { param, binder: fn_node_id }
-                }
-                LifetimeRes::Static | LifetimeRes::Error => continue,
-                res => {
-                    panic!(
-                        "Unexpected lifetime resolution {:?} for {:?} at {:?}",
-                        res, ident, ident.span
-                    )
-                }
-            };
-
-            let lifetime = Lifetime { id: outer_node_id, ident };
-            collected_lifetimes.push((inner_node_id, lifetime, Some(inner_res)));
-        }
-
-        debug!(?collected_lifetimes);
-
-        // We only want to capture the lifetimes that appear in the bounds. So visit the bounds to
-        // find out exactly which ones those are.
-        // in fn return position, like the `fn test<'a>() -> impl Debug + 'a` example,
-        // we only keep the lifetimes that appear in the `impl Debug` itself:
-        let lifetimes_to_remap = lifetime_collector::lifetimes_in_ret_ty(&self.resolver, output);
-        debug!(?lifetimes_to_remap);
-
-        self.with_hir_id_owner(opaque_ty_node_id, |this| {
-            // If this opaque type is only capturing a subset of the lifetimes (those that appear
-            // in bounds), then create the new lifetime parameters required and create a mapping
-            // from the old `'a` (on the function) to the new `'a` (on the opaque type).
-            collected_lifetimes.extend(
-                this.create_lifetime_defs(
-                    opaque_ty_def_id,
-                    &lifetimes_to_remap,
-                    &mut new_remapping,
-                )
-                .into_iter()
-                .map(|(new_node_id, lifetime)| (new_node_id, lifetime, None)),
-            );
-            debug!(?collected_lifetimes);
-            debug!(?new_remapping);
-
-            // Install the remapping from old to new (if any):
-            this.with_remapping(new_remapping, |this| {
-                // We have to be careful to get elision right here. The
-                // idea is that we create a lifetime parameter for each
-                // lifetime in the return type. So, given a return type
-                // like `async fn foo(..) -> &[&u32]`, we lower to `impl
-                // Future<Output = &'1 [ &'2 u32 ]>`.
-                //
-                // Then, we will create `fn foo(..) -> Foo<'_, '_>`, and
-                // hence the elision takes place at the fn site.
+        let opaque_ty_ref = self.lower_opaque_inner(
+            opaque_ty_node_id,
+            hir::OpaqueTyOrigin::AsyncFn(fn_def_id),
+            matches!(fn_kind, FnDeclKind::Trait),
+            captured_lifetimes,
+            span,
+            opaque_ty_span,
+            |this| {
                 let future_bound = this.lower_async_fn_output_type_to_future_bound(
                     output,
                     span,
-                    if in_trait && !this.tcx.features().return_position_impl_trait_in_trait {
+                    if let FnDeclKind::Trait = fn_kind
+                        && !this.tcx.features().return_position_impl_trait_in_trait
+                    {
                         ImplTraitContext::FeatureGated(
                             ImplTraitPosition::TraitReturn,
                             sym::return_position_impl_trait_in_trait,
@@ -2030,91 +1933,14 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     } else {
                         ImplTraitContext::ReturnPositionOpaqueTy {
                             origin: hir::OpaqueTyOrigin::FnReturn(fn_def_id),
-                            in_trait,
+                            fn_kind,
                         }
                     },
                 );
-
-                let generic_params = this.arena.alloc_from_iter(collected_lifetimes.iter().map(
-                    |&(new_node_id, lifetime, _)| {
-                        let hir_id = this.lower_node_id(new_node_id);
-                        debug_assert_ne!(this.opt_local_def_id(new_node_id), None);
-
-                        let (name, kind) = if lifetime.ident.name == kw::UnderscoreLifetime {
-                            (hir::ParamName::Fresh, hir::LifetimeParamKind::Elided)
-                        } else {
-                            (
-                                hir::ParamName::Plain(lifetime.ident),
-                                hir::LifetimeParamKind::Explicit,
-                            )
-                        };
-
-                        hir::GenericParam {
-                            hir_id,
-                            def_id: this.local_def_id(new_node_id),
-                            name,
-                            span: lifetime.ident.span,
-                            pure_wrt_drop: false,
-                            kind: hir::GenericParamKind::Lifetime { kind },
-                            colon_span: None,
-                            source: hir::GenericParamSource::Generics,
-                        }
-                    },
-                ));
-                debug!("lower_async_fn_ret_ty: generic_params={:#?}", generic_params);
-
-                let opaque_ty_item = hir::OpaqueTy {
-                    generics: this.arena.alloc(hir::Generics {
-                        params: generic_params,
-                        predicates: &[],
-                        has_where_clause_predicates: false,
-                        where_clause_span: this.lower_span(span),
-                        span: this.lower_span(span),
-                    }),
-                    bounds: arena_vec![this; future_bound],
-                    origin: hir::OpaqueTyOrigin::AsyncFn(fn_def_id),
-                    in_trait,
-                };
-
-                trace!("exist ty from async fn def id: {:#?}", opaque_ty_def_id);
-                this.generate_opaque_type(opaque_ty_def_id, opaque_ty_item, span, opaque_ty_span)
-            })
-        });
-
-        // As documented above, we need to create the lifetime
-        // arguments to our opaque type. Continuing with our example,
-        // we're creating the type arguments for the return type:
-        //
-        // ```
-        // Bar<'a, 'b, '0, '1, '_>
-        // ```
-        //
-        // For the "input" lifetime parameters, we wish to create
-        // references to the parameters themselves, including the
-        // "implicit" ones created from parameter types (`'a`, `'b`,
-        // '`0`, `'1`).
-        //
-        // For the "output" lifetime parameters, we just want to
-        // generate `'_`.
-        let generic_args = self.arena.alloc_from_iter(collected_lifetimes.into_iter().map(
-            |(_, lifetime, res)| {
-                let id = self.next_node_id();
-                let res = res.unwrap_or(
-                    self.resolver.get_lifetime_res(lifetime.id).unwrap_or(LifetimeRes::Error),
-                );
-                hir::GenericArg::Lifetime(self.new_named_lifetime_with_res(id, lifetime.ident, res))
+                arena_vec![this; future_bound]
             },
-        ));
-
-        // Create the `Foo<...>` reference itself. Note that the `type
-        // Foo = impl Trait` is, internally, created as a child of the
-        // async fn, so the *type parameters* are inherited. It's
-        // only the lifetime parameters that we must supply.
-        let opaque_ty_ref = hir::TyKind::OpaqueDef(
-            hir::ItemId { owner_id: hir::OwnerId { def_id: opaque_ty_def_id } },
-            generic_args,
-            in_trait,
         );
+
         let opaque_ty = self.ty(opaque_ty_span, opaque_ty_ref);
         hir::FnRetTy::Return(self.arena.alloc(opaque_ty))
     }
@@ -2162,7 +1988,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
     ) -> hir::GenericBound<'hir> {
         match tpb {
             GenericBound::Trait(p, modifier) => hir::GenericBound::Trait(
-                self.lower_poly_trait_ref(p, itctx),
+                self.lower_poly_trait_ref(p, itctx, modifier.to_constness()),
                 self.lower_trait_bound_modifier(*modifier),
             ),
             GenericBound::Outlives(lifetime) => {
@@ -2305,8 +2131,20 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         }
     }
 
-    fn lower_trait_ref(&mut self, p: &TraitRef, itctx: &ImplTraitContext) -> hir::TraitRef<'hir> {
-        let path = match self.lower_qpath(p.ref_id, &None, &p.path, ParamMode::Explicit, itctx) {
+    fn lower_trait_ref(
+        &mut self,
+        constness: ast::Const,
+        p: &TraitRef,
+        itctx: &ImplTraitContext,
+    ) -> hir::TraitRef<'hir> {
+        let path = match self.lower_qpath(
+            p.ref_id,
+            &None,
+            &p.path,
+            ParamMode::Explicit,
+            itctx,
+            Some(constness),
+        ) {
             hir::QPath::Resolved(None, path) => path,
             qpath => panic!("lower_trait_ref: unexpected QPath `{qpath:?}`"),
         };
@@ -2318,10 +2156,11 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         &mut self,
         p: &PolyTraitRef,
         itctx: &ImplTraitContext,
+        constness: ast::Const,
     ) -> hir::PolyTraitRef<'hir> {
         let bound_generic_params =
             self.lower_lifetime_binder(p.trait_ref.ref_id, &p.bound_generic_params);
-        let trait_ref = self.lower_trait_ref(&p.trait_ref, itctx);
+        let trait_ref = self.lower_trait_ref(constness, &p.trait_ref, itctx);
         hir::PolyTraitRef { bound_generic_params, trait_ref, span: self.lower_span(p.span) }
     }
 
@@ -2675,6 +2514,63 @@ struct GenericArgsCtor<'hir> {
 }
 
 impl<'hir> GenericArgsCtor<'hir> {
+    fn push_constness(&mut self, lcx: &mut LoweringContext<'_, 'hir>, constness: ast::Const) {
+        if !lcx.tcx.features().effects {
+            return;
+        }
+
+        // if bound is non-const, don't add host effect param
+        let ast::Const::Yes(span) = constness else { return };
+
+        let span = lcx.lower_span(span);
+
+        let id = lcx.next_node_id();
+        let hir_id = lcx.next_id();
+
+        let Some(host_param_id) = lcx.host_param_id else {
+            lcx.tcx
+                .sess
+                .delay_span_bug(span, "no host param id for call in const yet no errors reported");
+            return;
+        };
+
+        let body = lcx.lower_body(|lcx| {
+            (&[], {
+                let hir_id = lcx.next_id();
+                let res = Res::Def(DefKind::ConstParam, host_param_id.to_def_id());
+                let expr_kind = hir::ExprKind::Path(hir::QPath::Resolved(
+                    None,
+                    lcx.arena.alloc(hir::Path {
+                        span,
+                        res,
+                        segments: arena_vec![lcx; hir::PathSegment::new(Ident {
+                            name: sym::host,
+                            span,
+                        }, hir_id, res)],
+                    }),
+                ));
+                lcx.expr(span, expr_kind)
+            })
+        });
+
+        let attr_id = lcx.tcx.sess.parse_sess.attr_id_generator.mk_attr_id();
+        let attr = lcx.arena.alloc(Attribute {
+            kind: AttrKind::Normal(P(NormalAttr::from_ident(Ident::new(sym::rustc_host, span)))),
+            span,
+            id: attr_id,
+            style: AttrStyle::Outer,
+        });
+        lcx.attrs.insert(hir_id.local_id, std::slice::from_ref(attr));
+
+        let def_id =
+            lcx.create_def(lcx.current_hir_id_owner.def_id, id, DefPathData::AnonConst, span);
+        lcx.children.push((def_id, hir::MaybeOwner::NonOwner(hir_id)));
+        self.args.push(hir::GenericArg::Const(hir::ConstArg {
+            value: hir::AnonConst { def_id, hir_id, body },
+            span,
+        }))
+    }
+
     fn is_empty(&self) -> bool {
         self.args.is_empty()
             && self.bindings.is_empty()

@@ -1,4 +1,6 @@
-use crate::back::write::{self, save_temp_bitcode, DiagnosticHandlers};
+use crate::back::write::{
+    self, bitcode_section_name, save_temp_bitcode, CodegenDiagnosticsStage, DiagnosticHandlers,
+};
 use crate::errors::{
     DynamicLinkingWithLTO, LlvmError, LtoBitcodeFromRlib, LtoDisallowed, LtoDylib,
 };
@@ -7,7 +9,7 @@ use crate::{LlvmCodegenBackend, ModuleLlvm};
 use object::read::archive::ArchiveFile;
 use rustc_codegen_ssa::back::lto::{LtoModuleCodegen, SerializedModule, ThinModule, ThinShared};
 use rustc_codegen_ssa::back::symbol_export;
-use rustc_codegen_ssa::back::write::{CodegenContext, FatLTOInput, TargetMachineFactoryConfig};
+use rustc_codegen_ssa::back::write::{CodegenContext, FatLtoInput, TargetMachineFactoryConfig};
 use rustc_codegen_ssa::traits::*;
 use rustc_codegen_ssa::{looks_like_rust_object_file, ModuleCodegen, ModuleKind};
 use rustc_data_structures::fx::FxHashMap;
@@ -120,6 +122,7 @@ fn prepare_lto(
                 info!("adding bitcode from {}", name);
                 match get_bitcode_slice_from_object_data(
                     child.data(&*archive_data).expect("corrupt rlib"),
+                    cgcx,
                 ) {
                     Ok(data) => {
                         let module = SerializedModule::FromRlib(data.to_vec());
@@ -141,10 +144,29 @@ fn prepare_lto(
     Ok((symbols_below_threshold, upstream_modules))
 }
 
-fn get_bitcode_slice_from_object_data(obj: &[u8]) -> Result<&[u8], LtoBitcodeFromRlib> {
+fn get_bitcode_slice_from_object_data<'a>(
+    obj: &'a [u8],
+    cgcx: &CodegenContext<LlvmCodegenBackend>,
+) -> Result<&'a [u8], LtoBitcodeFromRlib> {
+    // We're about to assume the data here is an object file with sections, but if it's raw LLVM IR that
+    // won't work. Fortunately, if that's what we have we can just return the object directly, so we sniff
+    // the relevant magic strings here and return.
+    if obj.starts_with(b"\xDE\xC0\x17\x0B") || obj.starts_with(b"BC\xC0\xDE") {
+        return Ok(obj);
+    }
+    // We drop the "__LLVM," prefix here because on Apple platforms there's a notion of "segment name"
+    // which in the public API for sections gets treated as part of the section name, but internally
+    // in MachOObjectFile.cpp gets treated separately.
+    let section_name = bitcode_section_name(cgcx).trim_start_matches("__LLVM,");
     let mut len = 0;
-    let data =
-        unsafe { llvm::LLVMRustGetBitcodeSliceFromObjectData(obj.as_ptr(), obj.len(), &mut len) };
+    let data = unsafe {
+        llvm::LLVMRustGetSliceFromObjectDataByName(
+            obj.as_ptr(),
+            obj.len(),
+            section_name.as_ptr(),
+            &mut len,
+        )
+    };
     if !data.is_null() {
         assert!(len != 0);
         let bc = unsafe { slice::from_raw_parts(data, len) };
@@ -166,7 +188,7 @@ fn get_bitcode_slice_from_object_data(obj: &[u8]) -> Result<&[u8], LtoBitcodeFro
 /// for further optimization.
 pub(crate) fn run_fat(
     cgcx: &CodegenContext<LlvmCodegenBackend>,
-    modules: Vec<FatLTOInput<LlvmCodegenBackend>>,
+    modules: Vec<FatLtoInput<LlvmCodegenBackend>>,
     cached_modules: Vec<(SerializedModule<ModuleBuffer>, WorkProduct)>,
 ) -> Result<LtoModuleCodegen<LlvmCodegenBackend>, FatalError> {
     let diag_handler = cgcx.create_diag_handler();
@@ -220,7 +242,7 @@ pub(crate) fn prepare_thin(module: ModuleCodegen<ModuleLlvm>) -> (String, ThinBu
 fn fat_lto(
     cgcx: &CodegenContext<LlvmCodegenBackend>,
     diag_handler: &Handler,
-    modules: Vec<FatLTOInput<LlvmCodegenBackend>>,
+    modules: Vec<FatLtoInput<LlvmCodegenBackend>>,
     cached_modules: Vec<(SerializedModule<ModuleBuffer>, WorkProduct)>,
     mut serialized_modules: Vec<(SerializedModule<ModuleBuffer>, CString)>,
     symbols_below_threshold: &[*const libc::c_char],
@@ -245,8 +267,8 @@ fn fat_lto(
     }));
     for module in modules {
         match module {
-            FatLTOInput::InMemory(m) => in_memory.push(m),
-            FatLTOInput::Serialized { name, buffer } => {
+            FatLtoInput::InMemory(m) => in_memory.push(m),
+            FatLtoInput::Serialized { name, buffer } => {
                 info!("pushing serialized module {:?}", name);
                 let buffer = SerializedModule::Local(buffer);
                 serialized_modules.push((buffer, CString::new(name).unwrap()));
@@ -302,7 +324,13 @@ fn fat_lto(
         // The linking steps below may produce errors and diagnostics within LLVM
         // which we'd like to handle and print, so set up our diagnostic handlers
         // (which get unregistered when they go out of scope below).
-        let _handler = DiagnosticHandlers::new(cgcx, diag_handler, llcx);
+        let _handler = DiagnosticHandlers::new(
+            cgcx,
+            diag_handler,
+            llcx,
+            &module,
+            CodegenDiagnosticsStage::LTO,
+        );
 
         // For all other modules we codegened we'll need to link them into our own
         // bitcode. All modules were codegened in their own LLVM context, however,
@@ -326,7 +354,7 @@ fn fat_lto(
             let _timer = cgcx
                 .prof
                 .generic_activity_with_arg_recorder("LLVM_fat_lto_link_module", |recorder| {
-                    recorder.record_arg(format!("{:?}", name))
+                    recorder.record_arg(format!("{name:?}"))
                 });
             info!("linking {:?}", name);
             let data = bc_decoded.data();
@@ -435,7 +463,7 @@ fn thin_lto(
 
         for (i, (name, buffer)) in modules.into_iter().enumerate() {
             info!("local module: {} - {}", i, name);
-            let cname = CString::new(name.clone()).unwrap();
+            let cname = CString::new(name.as_bytes()).unwrap();
             thin_modules.push(llvm::ThinLTOModule {
                 identifier: cname.as_ptr(),
                 data: buffer.data().as_ptr(),
@@ -781,7 +809,7 @@ impl ThinLTOKeysMap {
         let file = File::create(path)?;
         let mut writer = io::BufWriter::new(file);
         for (module, key) in &self.keys {
-            writeln!(writer, "{} {}", module, key)?;
+            writeln!(writer, "{module} {key}")?;
         }
         Ok(())
     }
@@ -795,7 +823,7 @@ impl ThinLTOKeysMap {
             let mut split = line.split(' ');
             let module = split.next().unwrap();
             let key = split.next().unwrap();
-            assert_eq!(split.next(), None, "Expected two space-separated values, found {:?}", line);
+            assert_eq!(split.next(), None, "Expected two space-separated values, found {line:?}");
             keys.insert(module.to_string(), key.to_string());
         }
         Ok(Self { keys })

@@ -13,6 +13,7 @@ use crate::tokenstream::*;
 use crate::{ast::*, StaticItem};
 
 use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
+use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_data_structures::sync::Lrc;
 use rustc_span::source_map::Spanned;
 use rustc_span::symbol::Ident;
@@ -509,6 +510,9 @@ pub fn noop_visit_ty<T: MutVisitor>(ty: &mut P<Ty>, vis: &mut T) {
             visit_vec(bounds, |bound| vis.visit_param_bound(bound));
         }
         TyKind::MacCall(mac) => vis.visit_mac_call(mac),
+        TyKind::AnonStruct(fields) | TyKind::AnonUnion(fields) => {
+            fields.flat_map_in_place(|field| vis.flat_map_field_def(field));
+        }
     }
     vis.visit_span(span);
     visit_lazy_tts(tokens, vis);
@@ -1149,10 +1153,11 @@ pub fn noop_flat_map_assoc_item<T: MutVisitor>(
 }
 
 fn visit_const_item<T: MutVisitor>(
-    ConstItem { defaultness, ty, expr }: &mut ConstItem,
+    ConstItem { defaultness, generics, ty, expr }: &mut ConstItem,
     visitor: &mut T,
 ) {
     visit_defaultness(defaultness, visitor);
+    visitor.visit_generics(generics);
     visitor.visit_ty(ty);
     visit_opt(expr, |expr| visitor.visit_expr(expr));
 }
@@ -1368,7 +1373,7 @@ pub fn noop_visit_expr<T: MutVisitor>(
         ExprKind::If(cond, tr, fl) => {
             vis.visit_expr(cond);
             vis.visit_block(tr);
-            visit_opt(fl, |fl| vis.visit_expr(fl));
+            visit_opt(fl, |fl| ensure_sufficient_stack(|| vis.visit_expr(fl)));
         }
         ExprKind::While(cond, body, label) => {
             vis.visit_expr(cond);
@@ -1399,7 +1404,7 @@ pub fn noop_visit_expr<T: MutVisitor>(
             fn_decl,
             body,
             fn_decl_span,
-            fn_arg_span: _,
+            fn_arg_span,
         }) => {
             vis.visit_closure_binder(binder);
             visit_constness(constness, vis);
@@ -1407,6 +1412,7 @@ pub fn noop_visit_expr<T: MutVisitor>(
             vis.visit_fn_decl(fn_decl);
             vis.visit_expr(body);
             vis.visit_span(fn_decl_span);
+            vis.visit_span(fn_arg_span);
         }
         ExprKind::Block(blk, label) => {
             vis.visit_block(blk);
@@ -1419,9 +1425,10 @@ pub fn noop_visit_expr<T: MutVisitor>(
             vis.visit_expr(expr);
             vis.visit_span(await_kw_span);
         }
-        ExprKind::Assign(el, er, _) => {
+        ExprKind::Assign(el, er, span) => {
             vis.visit_expr(el);
             vis.visit_expr(er);
+            vis.visit_span(span);
         }
         ExprKind::AssignOp(_op, el, er) => {
             vis.visit_expr(el);
@@ -1431,9 +1438,10 @@ pub fn noop_visit_expr<T: MutVisitor>(
             vis.visit_expr(el);
             vis.visit_ident(ident);
         }
-        ExprKind::Index(el, er) => {
+        ExprKind::Index(el, er, brackets_span) => {
             vis.visit_expr(el);
             vis.visit_expr(er);
+            vis.visit_span(brackets_span);
         }
         ExprKind::Range(e1, e2, _lim) => {
             visit_opt(e1, |e1| vis.visit_expr(e1));
@@ -1457,6 +1465,7 @@ pub fn noop_visit_expr<T: MutVisitor>(
         ExprKind::Yeet(expr) => {
             visit_opt(expr, |expr| vis.visit_expr(expr));
         }
+        ExprKind::Become(expr) => vis.visit_expr(expr),
         ExprKind::InlineAsm(asm) => vis.visit_inline_asm(asm),
         ExprKind::FormatArgs(fmt) => vis.visit_format_args(fmt),
         ExprKind::OffsetOf(container, fields) => {

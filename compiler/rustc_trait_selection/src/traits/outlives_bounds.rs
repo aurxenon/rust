@@ -9,7 +9,7 @@ use rustc_span::def_id::LocalDefId;
 
 pub use rustc_middle::traits::query::OutlivesBound;
 
-type Bounds<'a, 'tcx: 'a> = impl Iterator<Item = OutlivesBound<'tcx>> + 'a;
+pub type Bounds<'a, 'tcx: 'a> = impl Iterator<Item = OutlivesBound<'tcx>> + 'a;
 pub trait InferCtxtExt<'a, 'tcx> {
     fn implied_outlives_bounds(
         &self,
@@ -57,16 +57,12 @@ impl<'a, 'tcx: 'a> InferCtxtExt<'a, 'tcx> for InferCtxt<'tcx> {
         let ty = OpportunisticRegionResolver::new(self).fold_ty(ty);
 
         // We do not expect existential variables in implied bounds.
-        // We may however encounter unconstrained lifetime variables in invalid
-        // code. See #110161 for context.
+        // We may however encounter unconstrained lifetime variables
+        // in very rare cases.
+        //
+        // See `ui/implied-bounds/implied-bounds-unconstrained-2.rs` for
+        // an example.
         assert!(!ty.has_non_region_infer());
-        if ty.has_infer() {
-            self.tcx.sess.delay_span_bug(
-                self.tcx.def_span(body_id),
-                "skipped implied_outlives_bounds due to unconstrained lifetimes",
-            );
-            return vec![];
-        }
 
         let mut canonical_var_values = OriginalQueryValues::default();
         let canonical_ty =
@@ -83,7 +79,8 @@ impl<'a, 'tcx: 'a> InferCtxtExt<'a, 'tcx> for InferCtxt<'tcx> {
                 &canonical_var_values,
                 canonical_result,
                 &mut constraints,
-            ) else {
+            )
+        else {
             return vec![];
         };
         assert_eq!(&obligations, &[]);

@@ -8,7 +8,7 @@ mod dep_node;
 
 pub use rustc_query_system::dep_graph::{
     debug::DepNodeFilter, hash_result, DepContext, DepNodeColor, DepNodeIndex,
-    SerializedDepNodeIndex, WorkProduct, WorkProductId,
+    SerializedDepNodeIndex, WorkProduct, WorkProductId, WorkProductMap,
 };
 
 pub use dep_node::{label_strs, DepKind, DepNode, DepNodeExt};
@@ -26,6 +26,7 @@ pub type DepKindStruct<'tcx> = rustc_query_system::dep_graph::DepKindStruct<TyCt
 impl rustc_query_system::dep_graph::DepKind for DepKind {
     const NULL: Self = DepKind::Null;
     const RED: Self = DepKind::Red;
+    const MAX: u16 = DepKind::VARIANTS - 1;
 
     fn debug_node(node: &DepNode, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}(", node.kind)?;
@@ -35,7 +36,7 @@ impl rustc_query_system::dep_graph::DepKind for DepKind {
                 if let Some(def_id) = node.extract_def_id(tcx) {
                     write!(f, "{}", tcx.def_path_debug_str(def_id))?;
                 } else if let Some(ref s) = tcx.dep_graph.dep_node_debug_str(*node) {
-                    write!(f, "{}", s)?;
+                    write!(f, "{s}")?;
                 } else {
                     write!(f, "{}", node.hash)?;
                 }
@@ -67,6 +68,21 @@ impl rustc_query_system::dep_graph::DepKind for DepKind {
             let Some(icx) = icx else { return };
             op(icx.task_deps)
         })
+    }
+
+    #[track_caller]
+    #[inline]
+    fn from_u16(u: u16) -> Self {
+        if u > Self::MAX {
+            panic!("Invalid DepKind {u}");
+        }
+        // SAFETY: See comment on DepKind::VARIANTS
+        unsafe { std::mem::transmute(u) }
+    }
+
+    #[inline]
+    fn to_u16(self) -> u16 {
+        self as u16
     }
 }
 
